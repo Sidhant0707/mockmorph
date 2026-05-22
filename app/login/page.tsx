@@ -8,10 +8,8 @@ import {
   Database,
   Terminal,
   Loader2,
-  Check,
-  Activity,
-  Shield,
-  Cpu,
+  Mail,
+  Lock,
 } from "lucide-react";
 import { FaGithub } from "react-icons/fa6";
 import { FcGoogle } from "react-icons/fc";
@@ -27,19 +25,13 @@ interface Particle {
 }
 
 export default function LoginPage() {
-  const [isLoading, setIsLoading] = useState(false);
-  const [oauthLoading, setOauthLoading] = useState<"github" | "google" | null>(
-    null,
-  );
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
+  const [oauthLoading, setOauthLoading] = useState<"github" | "google" | null>(null);
+  const [emailLoading, setEmailLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [particles, setParticles] = useState<Particle[]>([]);
-  const [stats, setStats] = useState({
-    connections: 0,
-    uptime: 0,
-    requests: 0,
-  });
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [showEmailForm, setShowEmailForm] = useState(false);
 
   const formRef = useRef<HTMLDivElement>(null);
   const mouseX = useMotionValue(0);
@@ -73,14 +65,6 @@ export default function LoginPage() {
       );
     });
 
-    const statsInterval = setInterval(() => {
-      setStats({
-        connections: Math.floor(Math.random() * 1000) + 12450,
-        uptime: 99.9,
-        requests: Math.floor(Math.random() * 100) + 8500,
-      });
-    }, 2000);
-
     const handleMouseMove = (e: MouseEvent) => {
       const { innerWidth, innerHeight } = window;
       mouseX.set(e.clientX - innerWidth / 2);
@@ -98,24 +82,10 @@ export default function LoginPage() {
     window.addEventListener("mousemove", handleMouseMove);
 
     return () => {
-      cancelAnimationFrame(animationFrame); // Cleanup the frame request
+      cancelAnimationFrame(animationFrame);
       window.removeEventListener("mousemove", handleMouseMove);
-      clearInterval(statsInterval);
     };
   }, [mouseX, mouseY, formMouseX, formMouseY]);
-
-  async function handleEmailLogin(e: React.SyntheticEvent) {
-    e.preventDefault();
-    setIsLoading(true);
-    setError(null);
-
-    setTimeout(() => {
-      setError(
-        "Email authentication requires NextAuth Credentials Provider setup.",
-      );
-      setIsLoading(false);
-    }, 1000);
-  }
 
   async function handleOAuth(provider: "github" | "google") {
     setOauthLoading(provider);
@@ -129,14 +99,30 @@ export default function LoginPage() {
     }
   }
 
-  const handleForgotPassword = async (e: React.MouseEvent) => {
+  async function handleEmailLogin(e: React.FormEvent) {
     e.preventDefault();
-    if (!email) {
-      setError("Please enter your email address first to reset your password.");
-      return;
+    setEmailLoading(true);
+    setError(null);
+
+    try {
+      const result = await signIn("credentials", {
+        email,
+        password,
+        redirect: false,
+        callbackUrl: "/",
+      });
+
+      if (result?.error) {
+        setError("Invalid email or password.");
+        setEmailLoading(false);
+      } else {
+        window.location.href = "/";
+      }
+    } catch (err) {
+      setError("Something went wrong. Please try again.");
+      setEmailLoading(false);
     }
-    alert("Password reset functionality requires an SMTP provider setup.");
-  };
+  }
 
   return (
     <div className="min-h-screen bg-[#050505] text-[#f1f5f9] flex flex-col md:flex-row overflow-hidden relative">
@@ -168,11 +154,6 @@ export default function LoginPage() {
             animation: shimmer 3s infinite;
           }
 
-          @keyframes pulse-glow {
-            0%, 100% { box-shadow: 0 0 20px rgba(6, 182, 212, 0.2); }
-            50% { box-shadow: 0 0 30px rgba(6, 182, 212, 0.4); }
-          }
-
           .magnetic-btn {
             transition: transform 0.2s ease-out;
           }
@@ -184,6 +165,7 @@ export default function LoginPage() {
         }}
       />
 
+      {/* Particle Background */}
       <div className="absolute inset-0 z-0 pointer-events-none overflow-hidden">
         {particles.map((particle) => (
           <motion.div
@@ -214,6 +196,7 @@ export default function LoginPage() {
         ))}
       </div>
 
+      {/* Perspective Grid */}
       <motion.div
         className="absolute inset-0 z-0 pointer-events-none perspective-grid"
         style={{
@@ -225,6 +208,7 @@ export default function LoginPage() {
         }}
       />
 
+      {/* Left Column (Hero Section) */}
       <div className="hidden md:flex md:w-1/2 lg:w-3/5 p-12 lg:p-24 flex-col justify-between relative z-10 border-r border-white/5 bg-black/40 backdrop-blur-sm">
         <div className="absolute inset-0 opacity-30 bg-[radial-gradient(ellipse_at_top_left,_var(--tw-gradient-stops))] from-cyber-900/40 via-transparent to-transparent pointer-events-none" />
 
@@ -234,14 +218,6 @@ export default function LoginPage() {
             y: useTransform(springY, [-500, 500], [-30, 30]),
           }}
           className="absolute top-1/4 -left-20 w-96 h-96 bg-cyber-500/20 rounded-full blur-[120px] pointer-events-none"
-        />
-
-        <motion.div
-          style={{
-            x: useTransform(springX, [-500, 500], [30, -30]),
-            y: useTransform(springY, [-500, 500], [30, -30]),
-          }}
-          className="absolute bottom-1/4 -right-20 w-80 h-80 bg-blue-500/20 rounded-full blur-[100px] pointer-events-none"
         />
 
         <div className="relative z-10">
@@ -328,62 +304,12 @@ export default function LoginPage() {
               ))}
             </div>
           </motion.div>
-
-          <motion.div
-            initial={{ opacity: 0, y: 20 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.8, delay: 1.2 }}
-            className="mt-16 grid grid-cols-3 gap-6"
-          >
-            {[
-              {
-                icon: Activity,
-                label: "Active Connections",
-                value: stats.connections.toLocaleString(),
-                color: "text-green-400",
-              },
-              {
-                icon: Shield,
-                label: "Uptime",
-                value: `${stats.uptime}%`,
-                color: "text-blue-400",
-              },
-              {
-                icon: Cpu,
-                label: "Requests/min",
-                value: stats.requests.toLocaleString(),
-                color: "text-purple-400",
-              },
-            ].map(({ icon: Icon, label, value, color }) => (
-              <motion.div
-                key={label}
-                className="relative overflow-hidden rounded-xl bg-white/[0.02] border border-white/10 p-4 backdrop-blur-sm"
-                whileHover={{ y: -2, borderColor: "rgba(6, 182, 212, 0.3)" }}
-                transition={{ type: "spring", stiffness: 300 }}
-              >
-                <div className="shimmer absolute inset-0 opacity-0 group-hover:opacity-100" />
-                <Icon className={`w-4 h-4 ${color} mb-2`} />
-                <div className="text-xs text-zinc-500 uppercase tracking-wider font-mono mb-1">
-                  {label}
-                </div>
-                <motion.div
-                  className="text-2xl font-bold text-white"
-                  key={value}
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ duration: 0.3 }}
-                >
-                  {value}
-                </motion.div>
-              </motion.div>
-            ))}
-          </motion.div>
         </div>
 
         <motion.div
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
-          transition={{ duration: 0.8, delay: 1.5 }}
+          transition={{ duration: 0.8, delay: 1.2 }}
           className="relative z-10"
         >
           <div className="flex items-center gap-3">
@@ -404,11 +330,11 @@ export default function LoginPage() {
                 SYS_STATUS: <span className="text-cyber-500">OPTIMAL</span>
               </p>
             </div>
-            <div className="text-xs text-zinc-700 font-mono">v2.4.1</div>
           </div>
         </motion.div>
       </div>
 
+      {/* Right Column (Auth Card) */}
       <div className="flex-1 flex flex-col items-center justify-center p-6 sm:p-12 lg:p-24 bg-[#0a0a0a]/80 backdrop-blur-xl relative z-10">
         <motion.div
           className="md:hidden mb-12"
@@ -440,27 +366,29 @@ export default function LoginPage() {
             rotateY: cardRotateY,
             transformStyle: "preserve-3d",
           }}
-          className="w-full max-w-[400px] relative"
+          className="w-full max-w-[420px] relative"
         >
           <div className="absolute -inset-4 bg-gradient-to-r from-cyber-500/20 to-blue-500/20 rounded-3xl blur-2xl opacity-0 group-hover:opacity-100 transition-opacity duration-500" />
 
-          <div className="relative bg-black/30 rounded-2xl p-8 border border-white/10 backdrop-blur-sm">
-            <div className="mb-10 text-center md:text-left">
+          <div className="relative bg-black/40 rounded-2xl p-10 border border-white/10 backdrop-blur-sm shadow-2xl">
+            <div className="mb-8 text-center">
               <motion.h2
-                className="text-3xl font-bold mb-2 tracking-tight"
+                className="text-3xl font-bold mb-3 tracking-tight"
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
                 transition={{ duration: 0.5, delay: 0.3 }}
               >
-                Welcome back
+                {showEmailForm ? "Welcome back" : "Authenticate"}
               </motion.h2>
               <motion.p
-                className="text-zinc-400"
+                className="text-zinc-400 text-sm"
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
                 transition={{ duration: 0.5, delay: 0.4 }}
               >
-                Sign in to initialize the generation engine.
+                {showEmailForm
+                  ? "Sign in with your email and password"
+                  : "Connect a provider to access the generation engine"}
               </motion.p>
             </div>
 
@@ -479,166 +407,129 @@ export default function LoginPage() {
               </motion.div>
             )}
 
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-8">
-              <motion.button
-                onClick={() => handleOAuth("github")}
-                disabled={oauthLoading !== null}
-                className="magnetic-btn bg-white/[0.03] hover:bg-white/[0.08] border border-white/10 px-4 py-3.5 rounded-xl flex items-center justify-center gap-3 text-sm font-bold active:scale-95 disabled:opacity-50 transition-all group relative overflow-hidden"
-                whileHover={{ scale: 1.02 }}
-                whileTap={{ scale: 0.98 }}
-              >
-                <div className="absolute inset-0 shimmer opacity-0 group-hover:opacity-100" />
-                {oauthLoading === "github" ? (
-                  <Loader2 className="w-5 h-5 animate-spin text-zinc-400" />
-                ) : (
-                  <FaGithub className="text-xl relative z-10" />
-                )}
-                <span className="relative z-10">GitHub</span>
-              </motion.button>
+            {!showEmailForm ? (
+              <>
+                <div className="flex flex-col gap-4 mb-6">
+                  <motion.button
+                    onClick={() => handleOAuth("github")}
+                    disabled={oauthLoading !== null}
+                    className="magnetic-btn bg-white/[0.03] hover:bg-white/[0.08] border border-white/10 px-6 py-4 rounded-xl flex items-center justify-center gap-4 text-sm font-bold active:scale-95 disabled:opacity-50 transition-all group relative overflow-hidden w-full"
+                    whileHover={{ scale: 1.02 }}
+                    whileTap={{ scale: 0.98 }}
+                  >
+                    <div className="absolute inset-0 shimmer opacity-0 group-hover:opacity-100" />
+                    {oauthLoading === "github" ? (
+                      <Loader2 className="w-5 h-5 animate-spin text-zinc-400" />
+                    ) : (
+                      <FaGithub className="text-xl relative z-10" />
+                    )}
+                    <span className="relative z-10 text-base tracking-wide">Continue with GitHub</span>
+                  </motion.button>
 
-              <motion.button
-                onClick={() => handleOAuth("google")}
-                disabled={oauthLoading !== null}
-                className="magnetic-btn bg-white/[0.03] hover:bg-white/[0.08] border border-white/10 px-4 py-3.5 rounded-xl flex items-center justify-center gap-3 text-sm font-bold active:scale-95 disabled:opacity-50 transition-all group relative overflow-hidden"
-                whileHover={{ scale: 1.02 }}
-                whileTap={{ scale: 0.98 }}
-              >
-                <div className="absolute inset-0 shimmer opacity-0 group-hover:opacity-100" />
-                {oauthLoading === "google" ? (
-                  <Loader2 className="w-5 h-5 animate-spin text-zinc-400" />
-                ) : (
-                  <FcGoogle className="text-xl relative z-10" />
-                )}
-                <span className="relative z-10">Google</span>
-              </motion.button>
-            </div>
+                  <motion.button
+                    onClick={() => handleOAuth("google")}
+                    disabled={oauthLoading !== null}
+                    className="magnetic-btn bg-white/[0.03] hover:bg-white/[0.08] border border-white/10 px-6 py-4 rounded-xl flex items-center justify-center gap-4 text-sm font-bold active:scale-95 disabled:opacity-50 transition-all group relative overflow-hidden w-full"
+                    whileHover={{ scale: 1.02 }}
+                    whileTap={{ scale: 0.98 }}
+                  >
+                    <div className="absolute inset-0 shimmer opacity-0 group-hover:opacity-100" />
+                    {oauthLoading === "google" ? (
+                      <Loader2 className="w-5 h-5 animate-spin text-zinc-400" />
+                    ) : (
+                      <FcGoogle className="text-xl relative z-10" />
+                    )}
+                    <span className="relative z-10 text-base tracking-wide">Continue with Google</span>
+                  </motion.button>
+                </div>
 
-            <div className="relative mb-8">
-              <div className="absolute inset-0 flex items-center">
-                <div className="w-full border-t border-white/10"></div>
-              </div>
-              <div className="relative flex justify-center text-xs uppercase tracking-widest font-mono">
-                <span className="bg-[#0f0f0f] px-4 text-zinc-600">
-                  Or secure email
-                </span>
-              </div>
-            </div>
+                <div className="relative my-6">
+                  <div className="absolute inset-0 flex items-center">
+                    <div className="w-full border-t border-white/10"></div>
+                  </div>
+                  <div className="relative flex justify-center text-xs uppercase tracking-widest font-mono">
+                    <span className="bg-black/40 px-4 text-zinc-500">or</span>
+                  </div>
+                </div>
 
-            <form className="space-y-5" onSubmit={handleEmailLogin}>
-              <motion.div
-                className="space-y-2"
-                initial={{ opacity: 0, x: -20 }}
-                animate={{ opacity: 1, x: 0 }}
-                transition={{ duration: 0.5, delay: 0.5 }}
-              >
-                <label className="text-[10px] font-mono font-bold uppercase tracking-widest text-zinc-500">
-                  Email Address
-                </label>
-                <input
-                  type="email"
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  placeholder="developer@mockmorph.dev"
-                  className="w-full px-4 py-3.5 rounded-xl bg-black/50 border border-white/10 transition-all focus:outline-none focus:border-cyber-500/50 focus:shadow-[0_0_15px_rgba(6,182,212,0.1)] text-sm placeholder:text-zinc-700 hover:border-white/20"
-                />
-              </motion.div>
+                <button
+                  onClick={() => setShowEmailForm(true)}
+                  className="w-full text-center text-sm text-zinc-400 hover:text-white transition-colors py-2"
+                >
+                  Sign in with email →
+                </button>
+              </>
+            ) : (
+              <form onSubmit={handleEmailLogin} className="space-y-5">
+                <div className="space-y-2">
+                  <label className="text-[10px] font-mono font-bold uppercase tracking-widest text-zinc-500">
+                    Email
+                  </label>
+                  <div className="relative">
+                    <Mail className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-500" />
+                    <input
+                      type="email"
+                      value={email}
+                      onChange={(e) => setEmail(e.target.value)}
+                      required
+                      className="w-full pl-10 pr-4 py-3.5 rounded-xl bg-black/50 border border-white/10 focus:border-cyber-500/50 focus:outline-none transition-all text-sm placeholder:text-zinc-700"
+                      placeholder="you@example.com"
+                    />
+                  </div>
+                </div>
 
-              <motion.div
-                className="space-y-2"
-                initial={{ opacity: 0, x: -20 }}
-                animate={{ opacity: 1, x: 0 }}
-                transition={{ duration: 0.5, delay: 0.6 }}
-              >
-                <div className="flex justify-between items-center">
+                <div className="space-y-2">
                   <label className="text-[10px] font-mono font-bold uppercase tracking-widest text-zinc-500">
                     Password
                   </label>
-                  <button
-                    type="button"
-                    onClick={handleForgotPassword}
-                    className="text-[10px] font-mono font-bold text-cyber-500 hover:text-cyber-400 transition-colors"
-                  >
-                    Forgot password?
-                  </button>
+                  <div className="relative">
+                    <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-500" />
+                    <input
+                      type="password"
+                      value={password}
+                      onChange={(e) => setPassword(e.target.value)}
+                      required
+                      className="w-full pl-10 pr-4 py-3.5 rounded-xl bg-black/50 border border-white/10 focus:border-cyber-500/50 focus:outline-none transition-all text-sm placeholder:text-zinc-700"
+                      placeholder="••••••••"
+                    />
+                  </div>
                 </div>
-                <input
-                  type="password"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  placeholder="••••••••"
-                  className="w-full px-4 py-3.5 rounded-xl bg-black/50 border border-white/10 transition-all focus:outline-none focus:border-cyber-500/50 focus:shadow-[0_0_15px_rgba(6,182,212,0.1)] text-sm placeholder:text-zinc-700 hover:border-white/20"
-                />
-              </motion.div>
 
-              <motion.div
-                className="flex items-center gap-3 pt-2"
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                transition={{ duration: 0.5, delay: 0.7 }}
-              >
-                <div className="relative flex items-center">
-                  <input
-                    type="checkbox"
-                    id="remember"
-                    className="peer w-4 h-4 rounded border-white/10 bg-white/5 checked:bg-cyber-500 checked:border-cyber-500 transition-all appearance-none cursor-pointer"
-                  />
-                  <Check className="w-3 h-3 absolute text-black pointer-events-none opacity-0 peer-checked:opacity-100 left-[2px]" />
-                </div>
-                <label
-                  htmlFor="remember"
-                  className="text-sm text-zinc-400 cursor-pointer select-none"
+                <button
+                  type="submit"
+                  disabled={emailLoading}
+                  className="w-full bg-cyber-500 text-black py-3.5 rounded-xl font-bold text-sm hover:bg-cyber-400 transition-all transform hover:scale-[1.02] active:scale-[0.98] disabled:opacity-70 flex items-center justify-center gap-2"
                 >
-                  Keep session active
-                </label>
-              </motion.div>
+                  {emailLoading ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    "Sign in"
+                  )}
+                </button>
 
-              <button
-                type="submit"
-                disabled={isLoading}
-                className="w-full bg-cyber-500 text-black py-4 rounded-xl font-bold text-sm tracking-tight hover:bg-cyber-400 transition-all transform hover:scale-[1.02] active:scale-[0.98] mt-6 flex items-center justify-center disabled:opacity-80 shadow-[0_0_20px_rgba(6,182,212,0.2)] hover:shadow-[0_0_25px_rgba(6,182,212,0.4)]"
-              >
-                {isLoading ? (
-                  <Loader2 className="w-5 h-5 animate-spin" />
-                ) : (
-                  "Initialize Session"
-                )}
-              </button>
-            </form>
+                <button
+                  type="button"
+                  onClick={() => setShowEmailForm(false)}
+                  className="w-full text-center text-xs text-zinc-500 hover:text-zinc-400 transition-colors mt-2"
+                >
+                  ← Back to OAuth
+                </button>
+              </form>
+            )}
 
             <motion.div
-              className="mt-10 text-center"
+              className="mt-8 text-center"
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
-              transition={{ duration: 0.5, delay: 0.9 }}
+              transition={{ duration: 0.5, delay: 0.7 }}
             >
-              <p className="text-sm text-zinc-500">
-                New to the platform?{" "}
-                <Link
-                  href="/signup"
-                  className="text-white font-bold hover:text-cyber-400 transition-colors relative group"
-                >
-                  Request access
-                  <span className="absolute -bottom-1 left-0 w-0 h-0.5 bg-cyber-400 group-hover:w-full transition-all duration-300" />
+              <p className="text-xs text-zinc-500">
+                By continuing, you agree to the{" "}
+                <Link href="#" className="text-zinc-400 hover:text-white transition-colors underline decoration-white/20 underline-offset-2">
+                  Terms of Service
                 </Link>
               </p>
             </motion.div>
-          </div>
-        </motion.div>
-
-        <motion.div
-          className="mt-12 flex items-center gap-6 text-xs text-zinc-600 font-mono"
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          transition={{ duration: 0.8, delay: 1 }}
-        >
-          <div className="flex items-center gap-2">
-            <Shield className="w-3 h-3 text-green-500" />
-            <span>256-bit Encryption</span>
-          </div>
-          <div className="w-px h-4 bg-white/10" />
-          <div className="flex items-center gap-2">
-            <Check className="w-3 h-3 text-green-500" />
-            <span>SOC 2 Compliant</span>
           </div>
         </motion.div>
       </div>
