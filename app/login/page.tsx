@@ -3,14 +3,7 @@
 import React, { useState, useEffect, useRef } from "react";
 import Link from "next/link";
 import { signIn } from "next-auth/react";
-import {
-  Zap,
-  Database,
-  Terminal,
-  Loader2,
-  Mail,
-  Lock,
-} from "lucide-react";
+import { Zap, Database, Terminal, Loader2, Mail, Lock } from "lucide-react";
 import { FaGithub } from "react-icons/fa6";
 import { FcGoogle } from "react-icons/fc";
 import { motion, useMotionValue, useSpring, useTransform } from "framer-motion";
@@ -25,7 +18,9 @@ interface Particle {
 }
 
 export default function LoginPage() {
-  const [oauthLoading, setOauthLoading] = useState<"github" | "google" | null>(null);
+  const [oauthLoading, setOauthLoading] = useState<"github" | "google" | null>(
+    null,
+  );
   const [emailLoading, setEmailLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [particles, setParticles] = useState<Particle[]>([]);
@@ -93,13 +88,14 @@ export default function LoginPage() {
 
     try {
       await signIn(provider, { callbackUrl: "/" });
-    } catch (err) {
+    } catch {
       setError("Authentication failed. Please try again.");
       setOauthLoading(null);
     }
   }
 
-  async function handleEmailLogin(e: React.FormEvent) {
+  async function handleEmailLogin(e: React.SyntheticEvent) {
+    e.preventDefault();
     e.preventDefault();
     setEmailLoading(true);
     setError(null);
@@ -118,7 +114,7 @@ export default function LoginPage() {
       } else {
         window.location.href = "/";
       }
-    } catch (err) {
+    } catch {
       setError("Something went wrong. Please try again.");
       setEmailLoading(false);
     }
@@ -423,7 +419,9 @@ export default function LoginPage() {
                     ) : (
                       <FaGithub className="text-xl relative z-10" />
                     )}
-                    <span className="relative z-10 text-base tracking-wide">Continue with GitHub</span>
+                    <span className="relative z-10 text-base tracking-wide">
+                      Continue with GitHub
+                    </span>
                   </motion.button>
 
                   <motion.button
@@ -439,7 +437,9 @@ export default function LoginPage() {
                     ) : (
                       <FcGoogle className="text-xl relative z-10" />
                     )}
-                    <span className="relative z-10 text-base tracking-wide">Continue with Google</span>
+                    <span className="relative z-10 text-base tracking-wide">
+                      Continue with Google
+                    </span>
                   </motion.button>
                 </div>
 
@@ -525,7 +525,10 @@ export default function LoginPage() {
             >
               <p className="text-xs text-zinc-500">
                 By continuing, you agree to the{" "}
-                <Link href="#" className="text-zinc-400 hover:text-white transition-colors underline decoration-white/20 underline-offset-2">
+                <Link
+                  href="#"
+                  className="text-zinc-400 hover:text-white transition-colors underline decoration-white/20 underline-offset-2"
+                >
                   Terms of Service
                 </Link>
               </p>
