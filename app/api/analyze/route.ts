@@ -1,187 +1,254 @@
 import { NextResponse } from 'next/server';
-import { getServerSession } from "next-auth/next";
-import { authOptions } from "@/app/api/auth/[...nextauth]/route";
-import { prisma } from "@/lib/prisma";
+import { prisma } from '@/lib/prisma';
+import { getSessionUserId } from '@/lib/session';
+import {
+  analyzeSchema,
+  AnalysisError,
+  GROQ_MODEL,
+  MAX_SCHEMA_CHARS,
+  normalizeSemanticMap,
+  type SemanticSchemaMap,
+  type SemanticType,
+} from '@/lib/groq';
 
-// Rate Limiting Constants
-const RATE_LIMIT = 5;
-const RESET_INTERVAL_MS = 60 * 60 * 1000; // 1 hour in milliseconds
+type Dialect = 'postgres' | 'mysql';
+const DIALECTS: readonly Dialect[] = ['postgres', 'mysql'];
+
+/** Everything here comes from the client, so it is typed `unknown` until validated. */
+interface RequestBody {
+  rawSchema?: unknown;
+  config?: { rowCount?: unknown; dialect?: unknown };
+  semanticMap?: unknown;
+}
+
+const LIMITS = {
+  MAX_ROWS: 10_000,
+  MIN_ROWS: 1,
+  DEFAULT_ROWS: 50,
+  BASE_PARENT_ROWS: 15,
+} as const;
+
+const STREAM = {
+  ROW_DELAY_MS: 10,
+  // The per-row delay is a "typing" effect. Past this many rows it only adds
+  // latency (10,000 rows would spend 100+ seconds asleep), so rows go out instantly.
+  MAX_ANIMATED_ROWS: 200,
+} as const;
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+// ---------------------------------------------------------------------------
+// Request parsing
+// ---------------------------------------------------------------------------
+
+/** Clamps to [MIN_ROWS, MAX_ROWS]. Without this a client could request billions of rows. */
+function parseRowCount(value: unknown): number {
+  const n = typeof value === 'string' && value.trim() !== '' ? Number(value) : value;
+  if (typeof n !== 'number' || !Number.isFinite(n)) return LIMITS.DEFAULT_ROWS;
+  return Math.min(LIMITS.MAX_ROWS, Math.max(LIMITS.MIN_ROWS, Math.trunc(n)));
+}
+
+function parseDialect(value: unknown): Dialect {
+  return DIALECTS.includes(value as Dialect) ? (value as Dialect) : 'postgres';
+}
+
+// ---------------------------------------------------------------------------
+// Value generation
+// ---------------------------------------------------------------------------
+
+interface ValueContext {
+  index: number;
+  parentMaxId: number;
+  dialect: Dialect;
+}
+
+const randomToken = (): string => Math.random().toString(36).substring(2, 9);
+
+/**
+ * Typed as Record<SemanticType, ...>, so adding a new semantic type in lib/groq.ts
+ * fails to compile here until a generator exists for it.
+ */
+const VALUE_GENERATORS: Record<SemanticType, (ctx: ValueContext) => string | number> = {
+  email: ({ index }) => `'user${index}_${randomToken()}@obsidian.corp'`,
+  fullname: () => `'Operative ${randomToken().toUpperCase()}'`,
+  price: () => (Math.random() * 5000 + 0.01).toFixed(2),
+  product: ({ index }) => `'Cyber-Asset MK-${String(index).padStart(3, '0')}'`,
+  company: ({ index }) => `'Syndicate ${index} LLC'`,
+  phone: () => `'555-01${String(Math.floor(10 + Math.random() * 90)).padStart(2, '0')}'`,
+  date: ({ index }) => `'2026-05-${String(((index - 1) % 28) + 1).padStart(2, '0')}'`,
+  boolean: ({ dialect }) => {
+    const value = Math.random() > 0.5;
+    if (dialect === 'mysql') return value ? 1 : 0;
+    return value ? 'TRUE' : 'FALSE';
+  },
+  fk: ({ parentMaxId }) => (parentMaxId > 0 ? Math.floor(Math.random() * parentMaxId) + 1 : 1),
+  pk: ({ index }) => index,
+  string: ({ index }) => `'string_val_${index}'`,
+};
+
+// ---------------------------------------------------------------------------
+// Streaming
+// ---------------------------------------------------------------------------
+
+/** Thrown internally to unwind the generation loop when the client disconnects. */
+class StreamCancelledError extends Error {}
+
+interface GenerationOptions {
+  userId: string;
+  schema: string;
+  providedMap: SemanticSchemaMap | null;
+  requestedRows: number;
+  dialect: Dialect;
+}
+
+function createGenerationStream(options: GenerationOptions): ReadableStream<Uint8Array> {
+  const { userId, schema, providedMap, requestedRows, dialect } = options;
+  const encoder = new TextEncoder();
+  const lines: string[] = [];
+  let cancelled = false;
+
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const send = async (text: string, delay = 0): Promise<void> => {
+        if (cancelled) throw new StreamCancelledError();
+        if (delay > 0) await sleep(delay);
+        // The client may have left while we slept; enqueue() on a closed stream throws.
+        if (cancelled) throw new StreamCancelledError();
+        lines.push(text);
+        controller.enqueue(encoder.encode(`${text}\n`));
+      };
+
+      try {
+        await send('-- [SYS] Initializing Hybrid LLM-Deterministic Edge Engine...', 50);
+
+        // Use the client's cached map when valid, otherwise ask the model.
+        let schemaMap: SemanticSchemaMap;
+        if (providedMap) {
+          await send('-- [SYS] Pre-verified Semantic Map received. Bypassing AI...', 50);
+          schemaMap = providedMap;
+        } else {
+          await send(`-- [SYS] Handshake with ${GROQ_MODEL} (Groq LPU) established.`, 50);
+          await send('-- [AI] Analyzing schema semantics on the fly...', 100);
+          schemaMap = await analyzeSchema(schema);
+        }
+
+        const { topology, tables } = schemaMap;
+        await send(`-- [AI] Topology Locked: ${topology.join(' -> ')}`, 50);
+        await send(`-- [EDGE] Executing Kahn's Algorithm chunking for ${dialect.toUpperCase()}...`, 100);
+        await send('', 50);
+
+        let totalGenerated = 0;
+        let parentMaxId: number = LIMITS.BASE_PARENT_ROWS;
+
+        for (let t = 0; t < topology.length; t++) {
+          // normalizeSemanticMap guarantees every topology entry exists in `tables` with >= 1 column.
+          const tableName = topology[t];
+          const columns = tables[tableName];
+          const columnNames = Object.keys(columns);
+
+          const isLastTable = t === topology.length - 1;
+          const rowsToGenerate = isLastTable
+            ? Math.max(1, requestedRows - totalGenerated)
+            : LIMITS.BASE_PARENT_ROWS;
+
+          await send(`INSERT INTO ${tableName} (${columnNames.join(', ')}) VALUES`, 50);
+
+          for (let row = 1; row <= rowsToGenerate; row++) {
+            const context: ValueContext = { index: row, parentMaxId, dialect };
+            const values = columnNames.map((name) => VALUE_GENERATORS[columns[name]](context));
+            const terminator = row === rowsToGenerate ? ';' : ',';
+            const delay = totalGenerated < STREAM.MAX_ANIMATED_ROWS ? STREAM.ROW_DELAY_MS : 0;
+            await send(`  (${values.join(', ')})${terminator}`, delay);
+            totalGenerated++;
+          }
+
+          parentMaxId = rowsToGenerate;
+          await send('', 20);
+        }
+
+        await send(
+          `-- [COMPLETE] ${totalGenerated} semantic rows generated. 100% Referential Integrity maintained.`,
+          50
+        );
+
+        // Saving history is best-effort: the user already has their data, so a DB
+        // hiccup should be a warning, not a "fatal error" printed under a finished result.
+        try {
+          await prisma.generation.create({
+            data: { userId, schema, mockData: `${lines.join('\n')}\n` },
+          });
+        } catch (error) {
+          console.error('[generate] failed to save generation:', error);
+          await send('-- [WARN] Output generated, but it could not be saved to your history.');
+        }
+      } catch (error) {
+        if (!(error instanceof StreamCancelledError)) {
+          console.error('[generate] stream failed:', error);
+          const message = error instanceof AnalysisError ? error.message : 'Unexpected internal error';
+          await send(`-- [FATAL ERROR] Core processing failure: ${message}`).catch(() => undefined);
+        }
+      } finally {
+        // After cancel() the stream is already closed and close() would throw.
+        if (!cancelled) controller.close();
+      }
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Route
+// ---------------------------------------------------------------------------
 
 export async function POST(req: Request) {
   try {
-    // ---------------------------------------------------------
-    // 1. AUTHENTICATION & SECURITY
-    // ---------------------------------------------------------
-    const session = await getServerSession(authOptions);
-
-    if (!session || !session.user) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    const userId = await getSessionUserId();
+    if (!userId) {
+      return NextResponse.json({ error: 'Authentication required' }, { status: 401 });
     }
 
-    // Safely access runtime id value
-    const userId = (session.user as unknown as Record<string, unknown>).id;
+    const body: unknown = await req.json().catch(() => null);
+    if (typeof body !== 'object' || body === null) {
+      return NextResponse.json({ error: 'Request body must be valid JSON' }, { status: 400 });
+    }
+    const { rawSchema, config, semanticMap } = body as RequestBody;
 
-    if (!userId || typeof userId !== 'string') {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    const schema = typeof rawSchema === 'string' ? rawSchema.trim() : '';
+    if (schema.length > MAX_SCHEMA_CHARS) {
+      return NextResponse.json(
+        { error: `Schema is too large (max ${MAX_SCHEMA_CHARS} characters)` },
+        { status: 413 }
+      );
     }
 
-    // ---------------------------------------------------------
-    // 2. DATABASE-BACKED RATE LIMITING
-    // ---------------------------------------------------------
-    const user = await prisma.user.findUnique({
-      where: { id: userId },
-      select: { analyzesUsed: true, lastResetTime: true },
+    // The map is client-supplied, so it goes through the same validation as model output.
+    // An invalid map is ignored and we fall back to AI analysis.
+    const providedMap = normalizeSemanticMap(semanticMap);
+    if (semanticMap != null && !providedMap) {
+      console.warn('[generate] ignoring invalid semanticMap from client');
+    }
+    if (!providedMap && !schema) {
+      return NextResponse.json({ error: 'Provide a SQL schema or a semantic map' }, { status: 400 });
+    }
+
+    const stream = createGenerationStream({
+      userId,
+      schema,
+      providedMap,
+      requestedRows: parseRowCount(config?.rowCount),
+      dialect: parseDialect(config?.dialect),
     });
 
-    if (!user) {
-      return NextResponse.json({ error: 'User not found' }, { status: 404 });
-    }
-
-    const now = new Date();
-    const timeSinceReset = now.getTime() - new Date(user.lastResetTime).getTime();
-
-    // Check if the 1-hour window has expired
-    if (timeSinceReset > RESET_INTERVAL_MS) {
-      // Reset the window and count
-      await prisma.user.update({
-        where: { id: userId },
-        data: {
-          analyzesUsed: 1,
-          lastResetTime: now,
-        },
-      });
-    } else {
-      // Window is active, check the limit
-      if (user.analyzesUsed >= RATE_LIMIT) {
-        return NextResponse.json(
-          { error: 'Rate limit exceeded. Please wait an hour before running another semantic analysis.' },
-          { status: 429 }
-        );
-      }
-
-      // Increment usage
-      await prisma.user.update({
-        where: { id: userId },
-        data: {
-          analyzesUsed: { increment: 1 },
-        },
-      });
-    }
-
-    // Calculate remaining uses for the frontend UI
-    const remaining = RATE_LIMIT - (timeSinceReset > RESET_INTERVAL_MS ? 1 : user.analyzesUsed + 1);
-
-    // ---------------------------------------------------------
-    // 3. INPUT VALIDATION
-    // ---------------------------------------------------------
-    const body = await req.json() as { rawSchema?: unknown };
-    const rawSchema = body.rawSchema;
-
-    if (!rawSchema || typeof rawSchema !== 'string') {
-      return NextResponse.json({ error: 'Valid SQL schema is required' }, { status: 400 });
-    }
-
-    // ---------------------------------------------------------
-    // 4. GROQ AI EXECUTION (Replaced Gemini)
-    // ---------------------------------------------------------
-    const apiKey = process.env.GROQ_API_KEY;
-    if (!apiKey) {
-      return NextResponse.json({ error: 'GROQ_API_KEY is missing' }, { status: 500 });
-    }
-
-    const aiPrompt = `Analyze this SQL schema and return a STRICT JSON object representing the database structure.
-    Required format:
-    {
-      "topology": ["table1", "table2"],
-      "tables": {
-        "table_name": {
-          "column_name": "semantic_type"
-        }
-      }
-    }
-    Allowed semantic types: pk, fk, email, fullname, price, product, company, phone, date, boolean, string
-    Order tables in dependency order (parents before children).
-    Schema to analyze:
-    ${rawSchema}
-    
-    Return ONLY the raw JSON object.`;
-
-    const groqResponse = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
+    return new Response(stream, {
       headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
       },
-      body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
-        messages: [
-          { role: 'system', content: 'You are an expert database analyzer. Always return strictly valid JSON matching the exact requested structure.' },
-          { role: 'user', content: aiPrompt }
-        ],
-        temperature: 0.1,
-        response_format: { type: "json_object" } // Enforces strict JSON from Groq
-      }),
     });
-
-    if (!groqResponse.ok) {
-       throw new Error(`Groq API Error: ${groqResponse.status}`);
-    }
-
-    const aiResult = await groqResponse.json();
-    const text = aiResult.choices[0].message.content;
-
-    // ---------------------------------------------------------
-    // 5. STRICT JSON PARSING & SANITIZATION
-    // ---------------------------------------------------------
-    const startIdx = text.indexOf('{');
-    const endIdx = text.lastIndexOf('}');
-
-    if (startIdx === -1 || endIdx === -1 || endIdx < startIdx) {
-      throw new Error('AI response did not contain a valid JSON block');
-    }
-
-    const jsonString = text.substring(startIdx, endIdx + 1);
-    
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(jsonString);
-    } catch (e: unknown) {
-      try {
-        // Fallback sanitization for trailing commas
-        const sanitized = jsonString.replace(/,\s*}/g, '}').replace(/,\s*]/g, ']');
-        parsed = JSON.parse(sanitized);
-      } catch {
-        throw new Error('Failed to parse AI response as JSON even after sanitization');
-      }
-    }
-
-    // ---------------------------------------------------------
-    // 6. TYPE SAFETY & RESPONSE FORMATTING
-    // ---------------------------------------------------------
-    if (
-      !parsed || 
-      typeof parsed !== 'object' || 
-      Array.isArray(parsed) || 
-      !('topology' in parsed) || 
-      !('tables' in parsed)
-    ) {
-       throw new Error('AI returned an invalid map structure');
-    }
-
-    const validParsed = parsed as Record<string, unknown>;
-
-    const topology = Array.isArray(validParsed.topology) 
-      ? validParsed.topology.flat(Infinity).map(String).filter(Boolean)
-      : [];
-
-    const tables = typeof validParsed.tables === 'object' && validParsed.tables !== null
-      ? validParsed.tables as Record<string, Record<string, string>>
-      : {};
-
-    return NextResponse.json({ topology, tables, remaining });
-
-  } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : 'Unknown analysis error';
-    return NextResponse.json({ error: message }, { status: 500 });
+  } catch (error) {
+    console.error('[generate] request failed:', error);
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }
