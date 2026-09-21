@@ -32,7 +32,7 @@ const pricingPlans = [
     period: "/forever",
     description: "Perfect for testing schemas and prototyping local builds.",
     features: [
-      "50 rows per generation",
+      "Up to 500 rows per generation (10,000 via API)",
       "Standard data types",
       "5 AI schema analyses per hour",
       "Raw SQL output",
@@ -47,7 +47,7 @@ const pricingPlans = [
     period: "/mo",
     description: "Production-grade mock data for serious engineering teams.",
     features: [
-      "10,000 rows per generation",
+      "50 AI schema analyses per hour",
       "Semantic AI data matching",
       "Unlimited daily generations",
       "Export to CSV, JSON, & SQL",
