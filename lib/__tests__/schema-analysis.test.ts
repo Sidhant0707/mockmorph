@@ -1,0 +1,108 @@
+import { describe, expect, it } from 'vitest';
+import { analyzeStructure, buildValidatedSemanticMap, SchemaAnalysisError } from '../schema-analysis';
+
+const USERS_ORDERS = `
+  CREATE TABLE users (
+    id SERIAL PRIMARY KEY,
+    email TEXT
+  );
+  CREATE TABLE orders (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id),
+    total DECIMAL(10,2)
+  );
+`;
+
+describe('analyzeStructure', () => {
+  it('computes a correct local topology for a simple schema', () => {
+    const { order } = analyzeStructure(USERS_ORDERS);
+    expect(order).toEqual(['users', 'orders']);
+  });
+
+  it('throws a SchemaAnalysisError for an unparseable schema', () => {
+    expect(() => analyzeStructure('not sql at all')).toThrow(SchemaAnalysisError);
+  });
+
+  it('throws with kind "circular_dependency" for a cyclic schema', () => {
+    const cyclic = `
+      CREATE TABLE a (id SERIAL PRIMARY KEY, b_id INTEGER REFERENCES b(id));
+      CREATE TABLE b (id SERIAL PRIMARY KEY, a_id INTEGER REFERENCES a(id));
+    `;
+    try {
+      analyzeStructure(cyclic);
+      expect.unreachable('expected analyzeStructure to throw');
+    } catch (error) {
+      expect(error).toBeInstanceOf(SchemaAnalysisError);
+      expect((error as SchemaAnalysisError).kind).toBe('circular_dependency');
+    }
+  });
+
+  it('throws with kind "missing_parent_table" when a FK targets a nonexistent table', () => {
+    const bad = `CREATE TABLE orders (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES nonexistent(id));`;
+    try {
+      analyzeStructure(bad);
+      expect.unreachable('expected analyzeStructure to throw');
+    } catch (error) {
+      expect((error as SchemaAnalysisError).kind).toBe('missing_parent_table');
+    }
+  });
+
+  it('rejects a malicious table identifier before it can reach generated SQL', () => {
+    const malicious = `CREATE TABLE "users); DROP TABLE users;--" (id SERIAL PRIMARY KEY);`;
+    try {
+      analyzeStructure(malicious);
+      expect.unreachable('expected analyzeStructure to throw');
+    } catch (error) {
+      expect((error as SchemaAnalysisError).kind).toBe('unsafe_identifier');
+    }
+  });
+});
+
+describe('buildValidatedSemanticMap (with a cached classification, so no network call is made)', () => {
+  it('always uses the locally computed topology, never anything the cache might claim', async () => {
+    const map = await buildValidatedSemanticMap(USERS_ORDERS, {
+      users: { email: 'email' },
+      orders: { total: 'price' },
+    });
+    expect(map.topology).toEqual(['users', 'orders']);
+    expect(map.tables.orders.columnTypes.user_id).toBe('fk'); // structural fact, not from the cache
+    expect(map.tables.users.columnTypes.id).toBe('pk');
+    expect(map.tables.orders.columnTypes.total).toBe('price'); // taken from the cache
+  });
+
+  it('coerces an unrecognized cached semantic type to "string" instead of failing', async () => {
+    const map = await buildValidatedSemanticMap(USERS_ORDERS, {
+      users: { email: 'not_a_real_type' },
+      orders: {},
+    });
+    expect(map.tables.users.columnTypes.email).toBe('string');
+  });
+
+  it('rejects a schema whose primary key is an unsupported type', async () => {
+    const badPk = `CREATE TABLE legacy (code VARCHAR(20) PRIMARY KEY, name TEXT);`;
+    await expect(buildValidatedSemanticMap(badPk, { legacy: {} })).rejects.toMatchObject({
+      kind: 'unsupported_primary_key_type',
+    });
+  });
+
+  it('rejects a schema with a composite primary key', async () => {
+    const composite = `
+      CREATE TABLE order_items (
+        order_id INTEGER,
+        product_id INTEGER,
+        PRIMARY KEY (order_id, product_id)
+      );
+    `;
+    await expect(buildValidatedSemanticMap(composite, { order_items: {} })).rejects.toMatchObject({
+      kind: 'unsupported_primary_key',
+    });
+  });
+
+  it('handles a malformed (non-object) cache by falling through cleanly (still rejects malformed array cache)', async () => {
+    // A cache that isn't a plausible object at all should not blow up the
+    // structural pass; buildValidatedTables just won't find any typed
+    // columns for it, everything defaults to 'string'.
+    const map = await buildValidatedSemanticMap(USERS_ORDERS, { users: 'not-an-object', orders: null });
+    expect(map.tables.users.columnTypes.email).toBe('string');
+  });
+});

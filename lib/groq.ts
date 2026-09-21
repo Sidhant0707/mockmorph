@@ -61,8 +61,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 const SEMANTIC_TYPE_SET: ReadonlySet<string> = new Set(SEMANTIC_TYPES);
 
-/** Unknown or malformed types degrade to 'string' instead of breaking generation. */
-function toSemanticType(value: unknown): SemanticType {
+/**
+ * Unknown or malformed types degrade to 'string' instead of breaking generation.
+ * Exported so lib/schema-analysis.ts can apply the same coercion to a
+ * client-supplied column-type cache without duplicating this logic.
+ */
+export function toSemanticType(value: unknown): SemanticType {
   const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
   return SEMANTIC_TYPE_SET.has(normalized) ? (normalized as SemanticType) : 'string';
 }
