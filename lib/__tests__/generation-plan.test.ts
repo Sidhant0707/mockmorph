@@ -7,6 +7,7 @@ import {
   type PkPools,
 } from '../generation-plan';
 import type { ValidatedSemanticMap, ValidatedTable } from '../schema-analysis';
+import { classifyColumnType, type ColumnTypeInfo } from '../sql-types';
 
 const LIMITS = { baseParentRows: 15, maxRows: 10_000, minRows: 1 };
 
@@ -15,6 +16,8 @@ function table(
   opts: {
     columns: string[];
     columnTypes: Record<string, ValidatedTable['columnTypes'][string]>;
+    /** Declared SQL types by column, e.g. { qty: 'INT' }. Omitted columns are "unknown" (semantic-only). */
+    sqlTypes?: Record<string, string>;
     primaryKey?: ValidatedTable['primaryKey'];
     foreignKeys?: ValidatedTable['foreignKeys'];
   }
@@ -23,6 +26,9 @@ function table(
     name,
     columns: opts.columns,
     columnTypes: opts.columnTypes,
+    columnInfo: Object.fromEntries(
+      Object.entries(opts.sqlTypes ?? {}).map(([col, type]): [string, ColumnTypeInfo] => [col, classifyColumnType(type)])
+    ),
     primaryKey: opts.primaryKey ?? { column: 'id', kind: 'integer' },
     foreignKeys: opts.foreignKeys ?? [],
   };
@@ -217,5 +223,137 @@ describe('generateTableRows: foreign-key pool invariants', () => {
     const myRows = runAll(new Map(), plan, 'mysql');
     expect(pgRows.flags.every((r) => r.active === 'TRUE' || r.active === 'FALSE')).toBe(true);
     expect(myRows.flags.every((r) => r.active === 0 || r.active === 1)).toBe(true);
+  });
+});
+
+describe('generateTableRows: values match the declared SQL type', () => {
+  /** Generates `rows` rows for a single-table schema and returns just the named column's values. */
+  function valuesOf(
+    sqlType: string,
+    opts: { semantic?: ValidatedTable['columnTypes'][string]; rows?: number; dialect?: Dialect } = {}
+  ): Array<string | number> {
+    const t = table('t', {
+      columns: ['id', 'col'],
+      columnTypes: { id: 'pk', col: opts.semantic ?? 'string' },
+      sqlTypes: { col: sqlType },
+    });
+    const plan = buildGenerationPlan(mapOf([t], ['t']), opts.rows ?? 300, LIMITS);
+    return runAll(new Map(), plan, opts.dialect).t.map((r) => r.col);
+  }
+
+  it('gives INT-like columns real integers (the original bug: they got string_val_N)', () => {
+    for (const type of ['INT', 'INTEGER', 'BIGINT', 'SMALLINT', 'SERIAL', 'int(11)']) {
+      const values = valuesOf(type);
+      expect(values.every((v) => Number.isInteger(v))).toBe(true);
+      expect(values.every((v) => (v as number) >= 1 && (v as number) <= 1000)).toBe(true);
+    }
+  });
+
+  it('ignores a semantic type that contradicts the declared integer type', () => {
+    const values = valuesOf('INT', { semantic: 'email' });
+    expect(values.every((v) => Number.isInteger(v))).toBe(true);
+  });
+
+  it('keeps TINYINT inside the signed range', () => {
+    expect(valuesOf('TINYINT(4)').every((v) => (v as number) <= 127)).toBe(true);
+  });
+
+  it('generates decimals that fit the declared precision and scale', () => {
+    const cases: Array<[string, number, number]> = [
+      ['DECIMAL(10,2)', 10, 2],
+      ['NUMERIC(5,0)', 5, 0],
+      ['DECIMAL(3,3)', 3, 3], // no integer digits at all: value must stay below 1
+      ['NUMERIC(1,0)', 1, 0],
+      ['NUMERIC(4,1)', 4, 1],
+    ];
+    for (const [type, precision, scale] of cases) {
+      for (const v of valuesOf(type, { rows: 500 })) {
+        const [intPart, fraction = ''] = String(v).split('.');
+        expect(fraction.length).toBe(scale);
+        const significant = intPart.replace(/^0+/, '').length + scale;
+        expect(significant).toBeLessThanOrEqual(precision);
+        expect(String(v)).not.toMatch(/e/i); // never scientific notation
+      }
+    }
+  });
+
+  it('generates floats as plain decimal numbers', () => {
+    for (const type of ['REAL', 'DOUBLE PRECISION', 'FLOAT']) {
+      expect(valuesOf(type).every((v) => /^\d+\.\d+$/.test(String(v)))).toBe(true);
+    }
+  });
+
+  it('generates dialect-correct booleans from the declared type, not just the semantic type', () => {
+    expect(valuesOf('BOOLEAN', { dialect: 'postgres' }).every((v) => v === 'TRUE' || v === 'FALSE')).toBe(true);
+    expect(valuesOf('BOOLEAN', { dialect: 'mysql' }).every((v) => v === 0 || v === 1)).toBe(true);
+    expect(valuesOf('TINYINT(1)', { dialect: 'mysql' }).every((v) => v === 0 || v === 1)).toBe(true);
+  });
+
+  it('generates well-formed dates, timestamps and times', () => {
+    expect(valuesOf('DATE').every((v) => /^'\d{4}-\d{2}-\d{2}'$/.test(String(v)))).toBe(true);
+    for (const type of ['TIMESTAMP', 'TIMESTAMPTZ', 'TIMESTAMP WITH TIME ZONE', 'DATETIME']) {
+      expect(valuesOf(type).every((v) => /^'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}'$/.test(String(v)))).toBe(true);
+    }
+    expect(valuesOf('TIME').every((v) => /^'\d{2}:\d{2}:\d{2}'$/.test(String(v)))).toBe(true);
+  });
+
+  it('never produces an invalid calendar day or clock time', () => {
+    for (const v of valuesOf('TIMESTAMP', { rows: 500 })) {
+      const m = String(v).match(/^'(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})'$/);
+      expect(m).not.toBeNull();
+      const [month, day, hour, minute, second] = m!.slice(2).map(Number);
+      expect(month).toBe(5);
+      expect(day).toBeGreaterThanOrEqual(1);
+      expect(day).toBeLessThanOrEqual(28);
+      expect(hour).toBeLessThanOrEqual(23);
+      expect(minute).toBeLessThanOrEqual(59);
+      expect(second).toBeLessThanOrEqual(59);
+    }
+  });
+
+  it('generates UUIDs, JSON and empty arrays', () => {
+    expect(valuesOf('UUID').every((v) => /^'[0-9a-f-]{36}'$/.test(String(v)))).toBe(true);
+    for (const v of valuesOf('JSONB')) {
+      expect(() => JSON.parse(String(v).slice(1, -1))).not.toThrow();
+    }
+    expect(valuesOf('TEXT[]').every((v) => v === "'{}'")).toBe(true);
+  });
+
+  it('still uses the semantic type for text columns', () => {
+    expect(valuesOf('VARCHAR(255)', { semantic: 'email' }).every((v) => /^'user\d+_\w+@obsidian\.corp'$/.test(String(v)))).toBe(true);
+    expect(valuesOf('TEXT', { semantic: 'company' }).every((v) => /^'Syndicate \d+ LLC'$/.test(String(v)))).toBe(true);
+  });
+
+  it('quotes semantic values that are bare on other columns (price, boolean) when the column is text', () => {
+    expect(valuesOf('VARCHAR(20)', { semantic: 'price' }).every((v) => /^'\d+\.\d{2}'$/.test(String(v)))).toBe(true);
+    expect(valuesOf('TEXT', { semantic: 'boolean' }).every((v) => v === "'TRUE'" || v === "'FALSE'")).toBe(true);
+  });
+
+  it('truncates text to the declared VARCHAR / CHAR length and keeps it quoted', () => {
+    for (const [type, max] of [['VARCHAR(5)', 5], ['CHAR(2)', 2], ['CHARACTER VARYING(8)', 8], ['CHAR', 1]] as const) {
+      for (const v of valuesOf(type, { semantic: 'email' })) {
+        const s = String(v);
+        expect(s.startsWith("'") && s.endsWith("'")).toBe(true);
+        expect(s.length - 2).toBeLessThanOrEqual(max);
+      }
+    }
+  });
+
+  it('falls back to the semantic template for a type it does not recognise (previous behaviour)', () => {
+    expect(valuesOf('order_status').every((v) => /^'string_val_\d+'$/.test(String(v)))).toBe(true);
+  });
+
+  it('never changes primary-key or foreign-key values, whatever their declared type', () => {
+    const parent = table('parent', { columns: ['id'], columnTypes: { id: 'pk' }, sqlTypes: { id: 'SERIAL' } });
+    const child = table('child', {
+      columns: ['id', 'parent_id'],
+      columnTypes: { id: 'pk', parent_id: 'fk' },
+      sqlTypes: { id: 'INT', parent_id: 'INT' },
+      foreignKeys: [{ column: 'parent_id', referencesTable: 'parent', referencesColumn: 'id' }],
+    });
+    const pools: PkPools = new Map();
+    const rows = runAll(pools, buildGenerationPlan(mapOf([parent, child], ['parent', 'child']), 100, LIMITS), 'postgres');
+    for (const row of rows.child) expect(pools.get('parent')).toContain(row.parent_id);
+    expect(rows.parent.map((r) => r.id)).toEqual(Array.from({ length: 15 }, (_, i) => i + 1));
   });
 });

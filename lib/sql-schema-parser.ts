@@ -174,6 +174,46 @@ function findCreateTableBlocks(sql: string): Array<{ name: string; body: string 
   return blocks;
 }
 
+/**
+ * Extracts the declared type from the text that follows a column name.
+ *
+ *   "VARCHAR(50) NOT NULL"         -> "VARCHAR(50)"
+ *   "double precision DEFAULT 0"   -> "double precision"
+ *   "character varying(50)"        -> "character varying(50)"
+ *   "timestamp(3) with time zone"  -> "timestamp(3) with time zone"
+ *   "text[] NOT NULL"              -> "text[]"
+ *
+ * Reading only the first word would turn "character varying(50)" into
+ * "character" and "double precision" into "double", losing exactly the
+ * information value generation needs (length limits, numeric kind).
+ */
+function extractRawType(rest: string): string {
+  const first = rest.match(/^(\w+)(\s*\([^)]*\))?/);
+  if (!first) return rest.split(/\s+/)[0];
+
+  let type = first[0];
+  let remainder = rest.slice(type.length);
+  const word = first[1].toLowerCase();
+
+  let continuation: RegExp | null = null;
+  if (word === 'double') continuation = /^\s+precision\b/i;
+  else if (word === 'character') continuation = /^\s+varying\b(?:\s*\([^)]*\))?/i;
+  else if (word === 'timestamp' || word === 'time') continuation = /^\s+with(?:out)?\s+time\s+zone\b/i;
+
+  if (continuation) {
+    const m = remainder.match(continuation);
+    if (m) {
+      type += m[0];
+      remainder = remainder.slice(m[0].length);
+    }
+  }
+
+  const arrays = remainder.match(/^(?:\s*\[\s*\d*\s*\])+/);
+  if (arrays) type += arrays[0];
+
+  return type.replace(/\s+/g, ' ');
+}
+
 const REFERENCES_RE = /references\s+("[^"]+"|`[^`]+`|[\w.]+)\s*\(\s*("[^"]+"|`[^`]+`|[\w]+)\s*\)/i;
 
 export function parseSchema(rawSql: string): ParseResult {
@@ -240,8 +280,7 @@ export function parseSchema(rawSql: string): ParseResult {
       }
       const colName = stripQuotes(tokens[1]);
       const rest = tokens[2];
-      const typeMatch = rest.match(/^([\w]+(?:\s*\([^)]*\))?)/);
-      const rawType = typeMatch ? typeMatch[1] : rest.split(/\s+/)[0];
+      const rawType = extractRawType(rest);
       const restLower = rest.toLowerCase();
 
       const isInlinePk = /\bprimary\s+key\b/.test(restLower);

@@ -16,6 +16,7 @@
 import { randomUUID } from 'crypto';
 import type { ValidatedSemanticMap, ValidatedTable } from './schema-analysis';
 import type { SemanticType } from './groq';
+import type { ColumnTypeInfo } from './sql-types';
 
 export type Dialect = 'postgres' | 'mysql';
 
@@ -144,6 +145,87 @@ const SCALAR_GENERATORS: Record<ScalarType, ScalarGenerator> = {
   string: ({ index }) => `'string_val_${index}'`,
 };
 
+// ---------------------------------------------------------------------------
+// Type-correct values
+//
+// The declared SQL type decides the SHAPE of a value (an INT column must get
+// an integer; a VARCHAR(8) must get at most 8 characters). The semantic type
+// above only decides the flavor of TEXT columns. See lib/sql-types.ts.
+// ---------------------------------------------------------------------------
+
+const randInt = (min: number, max: number): number => min + Math.floor(Math.random() * (max - min + 1));
+const pad2 = (n: number): string => String(n).padStart(2, '0');
+
+const UNKNOWN_COLUMN: ColumnTypeInfo = { kind: 'unknown', raw: '' };
+
+/** A DECIMAL/NUMERIC value that fits (precision, scale) — never rounds up past the column's limit. */
+function decimalValue(info: ColumnTypeInfo): string {
+  const scale = info.scale ?? 2;
+  const intDigits = info.precision === undefined ? 4 : info.precision - scale;
+  // Postgres 15+ allows scale > precision; then only a tiny fraction fits, and zero always does.
+  if (intDigits < 0) return scale === 0 ? '0' : `0.${'0'.repeat(scale)}`;
+  // Keep the integer part small (<= 5000) and inside the column's integer digits.
+  const intPart = intDigits === 0 ? 0 : randInt(0, Math.min(5000, 10 ** Math.min(intDigits, 4) - 1));
+  if (scale === 0) return String(intPart);
+  const fraction = Array.from({ length: scale }, () => randInt(0, 9)).join('');
+  return `${intPart}.${fraction}`;
+}
+
+/**
+ * Wraps a semantic generator's output as a string literal that fits the
+ * column's declared length. Semantic generators return already-quoted text
+ * ('...') for most types but bare numbers/keywords for price and boolean —
+ * on a text column all of those must be plain quoted strings.
+ */
+function toTextLiteral(value: string | number, maxLength: number | undefined): string {
+  let text = String(value);
+  if (text.length >= 2 && text.startsWith("'") && text.endsWith("'")) text = text.slice(1, -1);
+  if (maxLength !== undefined) text = text.slice(0, maxLength);
+  return `'${text.replace(/'/g, "''")}'`;
+}
+
+function semanticGenerator(type: SemanticType | undefined): ScalarGenerator {
+  return (SCALAR_GENERATORS as Record<string, ScalarGenerator | undefined>)[type ?? ''] ?? SCALAR_GENERATORS.string;
+}
+
+function generateColumnValue(
+  semanticType: SemanticType | undefined,
+  info: ColumnTypeInfo,
+  ctx: ValueContext
+): string | number {
+  switch (info.kind) {
+    case 'integer':
+      return randInt(1, info.maxInt ?? 1000);
+    case 'decimal':
+      return decimalValue(info);
+    case 'float':
+      return (Math.random() * 1000).toFixed(2);
+    case 'boolean':
+      return SCALAR_GENERATORS.boolean(ctx);
+    case 'date':
+      return SCALAR_GENERATORS.date(ctx);
+    case 'timestamp': {
+      const day = pad2(((ctx.index - 1) % 28) + 1);
+      return `'2026-05-${day} ${pad2(randInt(0, 23))}:${pad2(randInt(0, 59))}:${pad2(randInt(0, 59))}'`;
+    }
+    case 'time':
+      return `'${pad2(randInt(0, 23))}:${pad2(randInt(0, 59))}:${pad2(randInt(0, 59))}'`;
+    case 'uuid':
+      return `'${randomUUID()}'`;
+    case 'json':
+      return `'{"value": ${randInt(1, 1000)}}'`;
+    case 'array':
+      return `'{}'`;
+    case 'text':
+      return toTextLiteral(semanticGenerator(semanticType)(ctx), info.maxLength);
+    case 'unknown':
+    default:
+      // Unrecognised type: keep the previous behaviour (semantic template).
+      // schema-analysis records a warning for these columns.
+      return semanticGenerator(semanticType)(ctx);
+  }
+}
+
 export type PkPools = Map<string, (number | string)[]>;
 
 /**
@@ -196,10 +278,11 @@ export function* generateTableRows(
         continue;
       }
 
-      const semanticType = table.columnTypes[colName];
-      const generator =
-        (SCALAR_GENERATORS as Record<string, ScalarGenerator>)[semanticType] ?? SCALAR_GENERATORS.string;
-      row[colName] = generator({ index: i, dialect });
+      row[colName] = generateColumnValue(
+        table.columnTypes[colName],
+        table.columnInfo[colName] ?? UNKNOWN_COLUMN,
+        { index: i, dialect }
+      );
     }
 
     yield row;
