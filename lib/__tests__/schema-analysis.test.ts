@@ -106,3 +106,37 @@ describe('buildValidatedSemanticMap (with a cached classification, so no network
     expect(map.tables.users.columnTypes.email).toBe('string');
   });
 });
+
+describe('declared SQL types reach the generator', () => {
+  it('records what each column can hold, separately from its semantic type', async () => {
+    const map = await buildValidatedSemanticMap(
+      `CREATE TABLE items (
+         id SERIAL PRIMARY KEY,
+         quantity INT NOT NULL,
+         price DECIMAL(10,2),
+         label VARCHAR(30)
+       );`,
+      { items: { quantity: 'string', price: 'price', label: 'product' } }
+    );
+    const { columnInfo, columnTypes } = map.tables.items;
+    expect(columnInfo.quantity).toMatchObject({ kind: 'integer' });
+    expect(columnInfo.price).toMatchObject({ kind: 'decimal', precision: 10, scale: 2 });
+    expect(columnInfo.label).toMatchObject({ kind: 'text', maxLength: 30 });
+    // The semantic classification is untouched.
+    expect(columnTypes.label).toBe('product');
+  });
+
+  it('warns about a column type it cannot generate a value for', async () => {
+    const map = await buildValidatedSemanticMap(
+      'CREATE TABLE t (id SERIAL PRIMARY KEY, status order_status, n INT);',
+      { t: {} }
+    );
+    expect(map.warnings.some((w) => w.includes('t.status') && w.includes('order_status'))).toBe(true);
+    expect(map.warnings.some((w) => w.includes('t.n'))).toBe(false);
+  });
+
+  it('does not warn about key columns, whose values come from the key pools', async () => {
+    const map = await buildValidatedSemanticMap(USERS_ORDERS, { users: {}, orders: {} });
+    expect(map.warnings.filter((w) => w.includes('not recognized'))).toEqual([]);
+  });
+});

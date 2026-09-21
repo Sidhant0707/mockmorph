@@ -22,11 +22,15 @@ import { parseSchema, type ParsedTable, type PrimaryKeyKind } from './sql-schema
 import { resolveGenerationOrder, type TableNode } from './dependency-resolver';
 import { analyzeSchema as classifyWithGroq, toSemanticType, type SemanticType } from './groq';
 import { isSafeIdentifier } from './identifier-safety';
+import { classifyColumnType, type ColumnTypeInfo } from './sql-types';
 
 export interface ValidatedTable {
   name: string;
   columns: string[];
+  /** What each column is ABOUT (from Groq). Only decides the flavor of text columns. */
   columnTypes: Record<string, SemanticType>;
+  /** What each column can HOLD (from the declared SQL type, parsed locally). Decides the shape of every value. */
+  columnInfo: Record<string, ColumnTypeInfo>;
   primaryKey: { column: string; kind: Exclude<PrimaryKeyKind, 'unsupported'> } | null;
   foreignKeys: { column: string; referencesTable: string; referencesColumn: string }[];
 }
@@ -144,7 +148,8 @@ export function isPlausibleColumnTypeCache(value: unknown): value is Record<stri
 
 function buildValidatedTables(
   tables: ParsedTable[],
-  semanticTypesByTable: Record<string, Record<string, unknown>>
+  semanticTypesByTable: Record<string, Record<string, unknown>>,
+  warnings: string[]
 ): { validated: Record<string, ValidatedTable>; error: SchemaAnalysisError | null } {
   const validated: Record<string, ValidatedTable> = {};
 
@@ -172,7 +177,16 @@ function buildValidatedTables(
 
     const semanticCols = semanticTypesByTable[t.name] ?? {};
     const columnTypes: Record<string, SemanticType> = {};
+    const columnInfo: Record<string, ColumnTypeInfo> = {};
     for (const c of t.columns) {
+      const info = classifyColumnType(c.rawType);
+      columnInfo[c.name] = info;
+      // Only value columns matter here: PK/FK values come from the key pools, not from the type.
+      if (info.kind === 'unknown' && !c.isPrimaryKey && !c.isForeignKey) {
+        warnings.push(
+          `${t.name}.${c.name}: column type "${c.rawType}" is not recognized, so it is generated as text, which the database may reject.`
+        );
+      }
       if (c.isPrimaryKey) {
         columnTypes[c.name] = 'pk';
       } else if (c.isForeignKey) {
@@ -188,6 +202,7 @@ function buildValidatedTables(
       name: t.name,
       columns: t.columns.map((c) => c.name),
       columnTypes,
+      columnInfo,
       primaryKey:
         t.primaryKey && t.primaryKey.kind !== 'unsupported'
           ? { column: t.primaryKey.column, kind: t.primaryKey.kind }
@@ -231,7 +246,7 @@ export async function buildValidatedSemanticMap(
     semanticTypesByTable = groqResult.tables;
   }
 
-  const { validated, error } = buildValidatedTables(tables, semanticTypesByTable);
+  const { validated, error } = buildValidatedTables(tables, semanticTypesByTable, warnings);
   if (error) throw error;
 
   if (usedCache) warnings.push('Used cached semantic classification; no AI call was made for this request.');

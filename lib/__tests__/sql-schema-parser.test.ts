@@ -136,3 +136,52 @@ describe('parseSchema', () => {
     expect(warnings.some((w) => w.includes('UNIQUE'))).toBe(true);
   });
 });
+
+describe('declared column types (rawType)', () => {
+  const rawTypes = (ddl: string): Record<string, string> => {
+    const { tables } = parseSchema(ddl);
+    return Object.fromEntries(tables[0].columns.map((c) => [c.name, c.rawType]));
+  };
+
+  it('keeps multi-word Postgres types whole instead of cutting them at the first word', () => {
+    const types = rawTypes(`
+      CREATE TABLE t (
+        a DOUBLE PRECISION NOT NULL,
+        b CHARACTER VARYING(50),
+        c TIMESTAMP WITH TIME ZONE DEFAULT now(),
+        d TIMESTAMP(3) WITHOUT TIME ZONE,
+        e TIME WITH TIME ZONE
+      );
+    `);
+    expect(types.a).toBe('DOUBLE PRECISION');
+    expect(types.b).toBe('CHARACTER VARYING(50)');
+    expect(types.c).toBe('TIMESTAMP WITH TIME ZONE');
+    expect(types.d).toBe('TIMESTAMP(3) WITHOUT TIME ZONE');
+    expect(types.e).toBe('TIME WITH TIME ZONE');
+  });
+
+  it('keeps array suffixes', () => {
+    const types = rawTypes(`CREATE TABLE t (tags TEXT[] NOT NULL, grid INTEGER[3][3], names VARCHAR(10)[]);`);
+    expect(types.tags).toBe('TEXT[]');
+    expect(types.grid).toBe('INTEGER[3][3]');
+    expect(types.names).toBe('VARCHAR(10)[]');
+  });
+
+  it('does not swallow modifiers that follow a plain type', () => {
+    const types = rawTypes(`
+      CREATE TABLE t (
+        a INT NOT NULL,
+        b VARCHAR(20) DEFAULT 'x',
+        c TIMESTAMP DEFAULT now(),
+        d CHARACTER(3) NOT NULL,
+        e DECIMAL(10, 2) NOT NULL
+      );
+    `);
+    expect(types).toEqual({ a: 'INT', b: 'VARCHAR(20)', c: 'TIMESTAMP', d: 'CHARACTER(3)', e: 'DECIMAL(10, 2)' });
+  });
+
+  it('still classifies a serial primary key as an integer key', () => {
+    const { tables } = parseSchema('CREATE TABLE t (id SERIAL PRIMARY KEY, n INT);');
+    expect(tables[0].primaryKey).toEqual({ column: 'id', kind: 'integer' });
+  });
+});
