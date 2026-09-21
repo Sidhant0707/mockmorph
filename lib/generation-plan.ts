@@ -16,7 +16,7 @@
 import { randomUUID } from 'crypto';
 import type { ValidatedSemanticMap, ValidatedTable } from './schema-analysis';
 import type { SemanticType } from './groq';
-import type { ColumnTypeInfo } from './sql-types';
+import { TINYINT_MAX, type ColumnTypeInfo } from './sql-types';
 
 export type Dialect = 'postgres' | 'mysql';
 
@@ -158,6 +158,56 @@ const pad2 = (n: number): string => String(n).padStart(2, '0');
 
 const UNKNOWN_COLUMN: ColumnTypeInfo = { kind: 'unknown', raw: '' };
 
+/**
+ * A plain declared-integer column with no useful semantic type still fell
+ * back to a flat 1-1000 range (see the module docstring above), so e.g. an
+ * `age` column could come out as 876. This maps a short list of common,
+ * unambiguous column names to a sensible range. Matching is by whole word
+ * (see columnNameTokens), not substring, so "discount" or "account" never
+ * match "count".
+ *
+ * "year" and "count" have no single obvious real-world range; these are
+ * picked to be plausible defaults, not authoritative.
+ */
+const NAMED_INTEGER_RANGES: Record<string, [number, number]> = {
+  age: [18, 90],
+  quantity: [1, 50],
+  rating: [1, 5],
+  year: [1990, 2026],
+  count: [0, 100],
+};
+
+/** Splits a snake_case or camelCase identifier into lowercase word tokens. */
+function columnNameTokens(columnName: string): string[] {
+  return columnName
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+}
+
+/**
+ * A sensible [min, max] for this column name. `maxInt` is only a genuine
+ * hard database limit when it's TINYINT_MAX — every other declared integer
+ * kind (INT, BIGINT, SMALLINT, SERIAL, ...) shares one maxInt (1000) that is
+ * merely this generator's own default ceiling when no name matches, not the
+ * column's real capacity, so a named range isn't clamped against it. TINYINT
+ * is genuinely narrow, so its named range (e.g. "year", which doesn't fit)
+ * is clamped, falling back to undefined — the caller then uses the type's
+ * own default range — rather than emitting an out-of-range value.
+ */
+function namedIntegerRange(columnName: string, maxInt: number): [number, number] | undefined {
+  for (const token of columnNameTokens(columnName)) {
+    const range = NAMED_INTEGER_RANGES[token];
+    if (!range) continue;
+    const [min, max] = range;
+    if (maxInt > TINYINT_MAX) return [min, max];
+    const clampedMax = Math.min(max, maxInt);
+    return clampedMax >= min ? [min, clampedMax] : undefined;
+  }
+  return undefined;
+}
+
 /** A DECIMAL/NUMERIC value that fits (precision, scale) — never rounds up past the column's limit. */
 function decimalValue(info: ColumnTypeInfo): string {
   const scale = info.scale ?? 2;
@@ -191,11 +241,15 @@ function semanticGenerator(type: SemanticType | undefined): ScalarGenerator {
 function generateColumnValue(
   semanticType: SemanticType | undefined,
   info: ColumnTypeInfo,
-  ctx: ValueContext
+  ctx: ValueContext,
+  columnName: string
 ): string | number {
   switch (info.kind) {
-    case 'integer':
-      return randInt(1, info.maxInt ?? 1000);
+    case 'integer': {
+      const maxInt = info.maxInt ?? 1000;
+      const [min, max] = namedIntegerRange(columnName, maxInt) ?? [1, maxInt];
+      return randInt(min, max);
+    }
     case 'decimal':
       return decimalValue(info);
     case 'float':
@@ -281,7 +335,8 @@ export function* generateTableRows(
       row[colName] = generateColumnValue(
         table.columnTypes[colName],
         table.columnInfo[colName] ?? UNKNOWN_COLUMN,
-        { index: i, dialect }
+        { index: i, dialect },
+        colName
       );
     }
 
