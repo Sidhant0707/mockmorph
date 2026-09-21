@@ -51,12 +51,14 @@ export default function DocsSection() {
             </span>
           </div>
           <h2 className="text-3xl md:text-4xl font-bold tracking-tight text-white mb-4">
-            Integrate the Edge Engine.
+            Integrate the API.
           </h2>
           <p className="text-earth-400 max-w-2xl text-lg">
-            MockMorph provides a headless REST API, allowing you to synthesize
-            relational data directly within your CI/CD pipelines or local
-            testing scripts.
+            MockMorph exposes a REST API for synthesizing relational data.
+            Both endpoints currently require an authenticated browser
+            session (sign in via GitHub or Google) — there is no API-key
+            based access yet, so these endpoints aren&apos;t usable directly
+            from a CI/CD pipeline or an unauthenticated script.
           </p>
         </motion.div>
 
@@ -81,9 +83,11 @@ export default function DocsSection() {
                 Synthesize Payload
               </h3>
               <p className="text-earth-400 text-sm mb-6 leading-relaxed">
-                Stream a structurally sound SQL or JSON payload based on an
-                input schema. The engine uses Kahn&apos;s Algorithm to resolve
-                foreign key constraints before streaming.
+                Stream a structurally sound SQL payload based on an input
+                schema. Foreign-key relationships are parsed from your SQL
+                and the generation order is resolved locally with
+                Kahn&apos;s algorithm before any row is streamed — the
+                model is not trusted with ordering.
               </p>
 
               <div className="space-y-4">
@@ -143,9 +147,9 @@ export default function DocsSection() {
                   </span>
                 </div>
                 <CopyButton
-                  text={`curl -X POST https://mockmorph.com/api/generate \
+                  text={`curl -X POST https://mockmorph.vercel.app/api/generate \
 -H "Content-Type: application/json" \
--H "Authorization: Bearer YOUR_API_KEY" \
+-H "Cookie: next-auth.session-token=<your session cookie>" \
 -d '{
   "rawSchema": "CREATE TABLE users (id SERIAL PRIMARY KEY, email VARCHAR);",
   "config": {
@@ -159,7 +163,7 @@ export default function DocsSection() {
                 <pre className="text-[12px] font-mono leading-relaxed">
                   <span className="text-blue-400">curl</span>{" "}
                   <span className="text-zinc-300">
-                    -X POST https://mockmorph.com/api/generate \
+                    -X POST https://mockmorph.vercel.app/api/generate \
                   </span>
                   <br />
                   <span className="text-zinc-300"> -H </span>
@@ -170,7 +174,8 @@ export default function DocsSection() {
                   <br />
                   <span className="text-zinc-300"> -H </span>
                   <span className="text-green-400">
-                    &quot;Authorization: Bearer YOUR_API_KEY&quot;
+                    &quot;Cookie: next-auth.session-token=&lt;your session
+                    cookie&gt;&quot;
                   </span>
                   <span className="text-zinc-300"> \</span>
                   <br />
@@ -226,8 +231,10 @@ export default function DocsSection() {
                 Schema Intelligence
               </h3>
               <p className="text-earth-400 text-sm mb-6 leading-relaxed">
-                Utilize the LLM router to extract database topology and map
-                abstract column names to explicit semantic data types.
+                A Groq-hosted model classifies each column&apos;s semantic
+                type. Table order and foreign-key relationships are then
+                resolved locally from your SQL via Kahn&apos;s algorithm —
+                not by the model.
               </p>
 
               <div className="space-y-4">
@@ -241,7 +248,8 @@ export default function DocsSection() {
                       string[]
                     </div>
                     <div className="text-xs text-zinc-400">
-                      Ordered array for safe inserts.
+                      Locally resolved (Kahn&apos;s algorithm) order for
+                      safe inserts.
                     </div>
                   </div>
                   <div className="grid grid-cols-3 p-4">
@@ -250,7 +258,7 @@ export default function DocsSection() {
                       Object
                     </div>
                     <div className="text-xs text-zinc-400">
-                      Map of table columns to semantic types.
+                      Map of table columns to AI-classified semantic types.
                     </div>
                   </div>
                 </div>

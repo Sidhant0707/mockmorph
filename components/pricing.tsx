@@ -34,7 +34,7 @@ const pricingPlans = [
     features: [
       "50 rows per generation",
       "Standard data types",
-      "10 generations per day",
+      "5 AI schema analyses per hour",
       "Raw SQL output",
     ],
     cta: "Current Plan",

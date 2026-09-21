@@ -61,7 +61,7 @@ export default function HeroSection() {
       });
       await new Promise((r) => setTimeout(r, 400));
       setBadgeState({
-        text: "Next.js 15 + Edge Streaming",
+        text: "Next.js 16 + Streaming SQL",
         color: "bg-cyber-500",
         pulse: true,
       });
@@ -154,7 +154,7 @@ export default function HeroSection() {
                 variants={fadeInUp}
                 className="text-4xl sm:text-5xl md:text-[4.5rem] leading-[1.1] sm:leading-[1.05] font-extrabold tracking-tight mb-4 sm:mb-6"
               >
-                <span className="text-white block">Production-grade</span>
+                <span className="text-white block">Schema-aware</span>
                 <span className="text-white block">mock data.</span>
                 <span className="bg-gradient-to-br from-cyber-200 via-cyber-400 to-cyber-600 bg-clip-text text-transparent block mt-1">
                   Zero privacy violations.
@@ -165,9 +165,10 @@ export default function HeroSection() {
                 variants={fadeInUp}
                 className="text-sm sm:text-base md:text-lg leading-relaxed text-cyber-400 max-w-lg mb-8 sm:mb-10 font-normal"
               >
-                Stop risking GDPR leaks with production data DB dumps. Generate
-                relationally perfect SQL directly to your local machine using a
-                Hybrid LLM-Deterministic Edge engine.
+                Stop risking leaks with production data DB dumps. Generate
+                relationally consistent SQL directly to your local machine —
+                schema classification via a Groq-hosted model, dependency
+                order and foreign keys resolved locally with Kahn&apos;s algorithm.
               </motion.p>
 
               <motion.div
@@ -199,9 +200,9 @@ export default function HeroSection() {
                 className="flex flex-wrap items-center gap-6 sm:gap-10 mt-10 sm:mt-14 pt-8 border-t border-white/10"
               >
                 {[
-                  { value: "10M+", label: "Rows Generated" },
-                  { value: "<8s", label: "Avg. Generation" },
-                  { value: "100%", label: "FK Integrity" },
+                  { value: "Local", label: "Kahn's Algorithm" },
+                  { value: "Live", label: "Streamed SQL" },
+                  { value: "2", label: "OAuth Providers" },
                 ].map((stat, idx) => (
                   <motion.div
                     key={idx}

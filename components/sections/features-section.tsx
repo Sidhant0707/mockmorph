@@ -7,18 +7,18 @@ import { IconHover3D } from '@/components/ui/icon-hover-3d';
 
 const features = [
   {
-    heading: "AI Pattern Discovery",
-    text: "Gemini 2.5 Flash analyzes your schema relationships, not just column types. It understands semantic patterns — names look like names, emails are properly formatted, and amounts fall within realistic ranges.",
+    heading: "AI Semantic Classification",
+    text: "A Groq-hosted model reads your schema and classifies each column — email, price, name, and eight other semantic types — so generated values pick the right kind of fake data instead of a generic placeholder.",
     icon: <HiOutlineSparkles className="text-3xl" />
   },
   {
-    heading: "O(1) Edge Streaming",
-    text: "Bypasses Vercel timeouts and memory limits by yielding data chunk-by-chunk directly to your terminal. Each row is flushed the moment it's generated — no buffering, no waiting.",
+    heading: "Real-Time Streaming",
+    text: "Rows are yielded chunk-by-chunk to your terminal via the Web Streams API the moment each one is generated — no buffering the full result before you see anything, and a disconnect stops work server-side immediately.",
     icon: <HiOutlineBolt className="text-3xl" />
   },
   {
-    heading: "Relational Enforcer",
-    text: "Kahn's Algorithm topologically sorts your dependency graph to handle complex foreign keys and circular references. Every row is valid on INSERT — guaranteed.",
+    heading: "Locally Verified Dependency Order",
+    text: "Table and foreign-key relationships are parsed from your SQL and topologically sorted with Kahn's algorithm — run locally, not left to the AI's judgment. A cycle or a foreign key with no matching table is rejected before any row is generated, and every foreign key value is drawn from that specific parent table's actually-generated primary keys.",
     icon: <HiOutlineShieldCheck className="text-3xl" />
   }
 ];
@@ -41,7 +41,7 @@ export default function FeaturesSection() {
             <span className="text-[10px] sm:text-xs text-cyber-400 tracking-wide font-medium uppercase">Architecture</span>
           </div>
           <h2 className="text-3xl sm:text-4xl md:text-5xl font-bold tracking-tight text-white mb-4">Engineered for production</h2>
-          <p className="text-cyber-400 text-base sm:text-lg max-w-2xl mx-auto font-light">Three pillars that make MockMorph the definitive choice for enterprise mock data generation.</p>
+          <p className="text-cyber-400 text-base sm:text-lg max-w-2xl mx-auto font-light">Three pillars behind how MockMorph turns a SQL schema into relationally-consistent mock data.</p>
         </motion.div>
 
         <div className="grid grid-cols-1 gap-6 max-w-4xl mx-auto">
