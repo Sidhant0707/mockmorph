@@ -1,36 +1,208 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# MockMorph
 
-## Getting Started
+Schema-aware mock data for SQL. Paste your `CREATE TABLE` statements and MockMorph streams back ready-to-run `INSERT` statements for **PostgreSQL** or **MySQL**, with foreign keys that point at rows that actually exist.
 
-First, run the development server:
+Table structure (order, primary keys, foreign keys) is worked out **locally** by a SQL parser and a topological sort. An AI model (Groq) is used for one narrow job only: labelling each plain column with a semantic type (email, name, price, ...) so the fake values look sensible.
+
+## Features
+
+- **Local dependency resolution.** Foreign-key relationships are parsed from your SQL and ordered with Kahn's algorithm, so parent tables are always inserted before their children. Cycles and foreign keys pointing at missing tables are rejected before any row is generated.
+- **Correct foreign keys.** Every table keeps a pool of the primary keys it generated. A foreign key picks its value from the pool of the table its `REFERENCES` clause names, however many tables sit in between.
+- **Integer and UUID primary keys.** Integer keys are sequential; UUID keys are real random UUIDs.
+- **Streaming output.** Results stream to the terminal-style UI as they are generated. Copy them or download as `.sql`.
+- **AI semantic labels, with overrides.** Analyze a schema once, adjust any column's type in the UI, and reuse that classification without spending another AI call.
+- **Generation history.** Signed-in users get a dashboard of past generations, recorded as `completed`, `failed` or `cancelled`.
+- **Identifier safety.** Every table and column name is validated against a strict allowlist before it can appear in generated SQL.
+
+## How it works
+
+1. `lib/sql-schema-parser.ts` parses `CREATE TABLE` statements into tables, columns, primary keys and foreign keys.
+2. `lib/dependency-resolver.ts` runs Kahn's algorithm over the foreign-key graph to get the generation order.
+3. `lib/schema-analysis.ts` combines both, validates identifiers and primary-key support, and asks Groq for column semantic types (unless a cached classification is supplied).
+4. `lib/generation-plan.ts` validates the full plan (every foreign key must target a primary key that is generated earlier) and then produces the rows.
+5. `app/api/generate/route.ts` streams the `INSERT` statements and saves the run to the database.
+
+Steps 1–2 run on every request. The client cannot supply table order, keys or relationships.
+
+## Tech stack
+
+- [Next.js](https://nextjs.org) 16 (App Router, Turbopack), React 19, TypeScript
+- Tailwind CSS 4, Framer Motion, Three.js / React Three Fiber
+- NextAuth v4 with the Prisma adapter (GitHub and Google sign-in)
+- Prisma 6 with PostgreSQL
+- [Groq](https://groq.com) chat completions API (default model `openai/gpt-oss-120b`)
+- Vitest for tests
+
+## Getting started
+
+### Prerequisites
+
+- Node.js **20.9 or newer**
+- A PostgreSQL database (a hosted one such as Supabase or Neon works)
+- A [Groq API key](https://console.groq.com)
+- A GitHub and/or Google OAuth app (see below)
+
+### 1. Install
+
+```bash
+git clone https://github.com/sidhant0707/mockmorph.git
+cd mockmorph
+npm ci
+```
+
+### 2. Configure environment variables
+
+Create a `.env` file in the project root. Do not commit it (`.env*` is already in `.gitignore`).
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `DATABASE_URL` | yes | PostgreSQL connection string used by the app |
+| `DIRECT_URL` | yes | Direct (non-pooled) connection string, used by Prisma for schema changes |
+| `NEXTAUTH_SECRET` | yes | Secret used to sign auth cookies and tokens |
+| `NEXTAUTH_URL` | yes in production | Public URL of the app, e.g. `http://localhost:3000` locally |
+| `GITHUB_ID`, `GITHUB_SECRET` | for GitHub sign-in | GitHub OAuth app credentials |
+| `GOOGLE_ID`, `GOOGLE_SECRET` | for Google sign-in | Google OAuth credentials |
+| `GROQ_API_KEY` | yes | Groq API key for semantic classification |
+| `GROQ_MODEL` | no | Override the default Groq model without a code change |
+
+If your database provider does not distinguish pooled and direct connections, set `DIRECT_URL` to the same value as `DATABASE_URL`.
+
+### 3. Set up the database
+
+```bash
+npx prisma db push
+```
+
+This creates the tables (users, sessions, generations, ...). The project does not use migration files, so use `db push` rather than `prisma migrate dev`.
+
+### 4. Run it
 
 ```bash
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:3000](http://localhost:3000).
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+### OAuth callback URLs
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Sign-in only works from URLs registered on your OAuth app. The callback path is:
 
-## Learn More
+- GitHub: `<your-origin>/api/auth/callback/github`
+- Google: `<your-origin>/api/auth/callback/google`
 
-To learn more about Next.js, take a look at the following resources:
+A GitHub OAuth app holds a single callback URL, so use a separate OAuth app for local development (callback `http://localhost:3000/api/auth/callback/github`) and put its credentials in `.env.local`, which overrides `.env` and is also git-ignored.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Scripts
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+| Command | What it does |
+|---|---|
+| `npm run dev` | Start the development server |
+| `npm run build` | Production build |
+| `npm start` | Run the production build |
+| `npm run lint` | Lint with ESLint |
+| `npm test` | Run the unit tests (Vitest) |
 
-## Deploy on Vercel
+## API
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+Both endpoints require a signed-in session cookie. There are no API keys, so they are meant to be called from the app's own UI, not from scripts.
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+### `POST /api/analyze`
+
+Parses the schema locally, then asks Groq for column semantic types.
+
+```json
+{ "rawSchema": "CREATE TABLE users (...); CREATE TABLE orders (...);" }
+```
+
+Returns `{ topology, tables, warnings, remaining }`, where `topology` is the locally computed insert order, `tables` maps each table to its column types, and `remaining` is your remaining AI calls this hour.
+
+### `POST /api/generate`
+
+Streams `INSERT` statements as plain text.
+
+```json
+{
+  "rawSchema": "CREATE TABLE users (...); ...",
+  "config": { "rowCount": 50, "dialect": "postgres" },
+  "cachedColumnTypes": { "users": { "email": "email" } }
+}
+```
+
+- `dialect` is `postgres` (default) or `mysql`.
+- `rowCount` is clamped to 1–10,000 (default 50). The UI slider covers 10–500.
+- `cachedColumnTypes` is optional. Send the `tables` object from a previous `/api/analyze` call to skip the AI call.
+
+### Limits
+
+- Schemas are limited to 50,000 characters.
+- AI calls are limited to **5 per hour per user**, shared by `/api/analyze` and by `/api/generate` when it has to call Groq itself (no `cachedColumnTypes`). Schemas that can never be generated (cycles, missing tables, unsupported keys) are rejected before any AI call or quota use.
+- Row distribution: every table except the last one in dependency order gets 15 rows; the last table gets the remainder of the requested total (at least 1). With many tables the total can exceed the requested count.
+
+## Supported SQL
+
+Supported:
+
+- `CREATE TABLE [IF NOT EXISTS] name (...)`
+- Column-level `PRIMARY KEY`, `REFERENCES table(col)`, `NOT NULL`, `UNIQUE`, `DEFAULT`
+- Table-level `PRIMARY KEY (col)` and `FOREIGN KEY (col) REFERENCES table(col)`
+- Integer primary keys (`INT`, `INTEGER`, `SMALLINT`, `BIGINT`, `SERIAL`, `BIGSERIAL`, `SMALLSERIAL`) and `UUID` primary keys
+- Quoted identifiers (`"name"`, `` `name` ``)
+
+Not supported yet:
+
+- Composite (multi-column) primary or foreign keys
+- Primary keys of other types (e.g. `TEXT`, `VARCHAR`)
+- Foreign keys that reference a column other than the parent's primary key
+- `ALTER TABLE ... ADD CONSTRAINT`, `CREATE INDEX` and `CHECK` constraints (skipped with a warning)
+
+## Known limitations
+
+These are open issues rather than design choices:
+
+- **Self-referencing foreign keys** (for example `employees.manager_id REFERENCES employees(id)`) are rejected.
+- **A primary key that is also a foreign key** (one-to-one extension tables) can generate foreign-key violations.
+- **Plain integer columns** (such as `quantity` or `stock`) are filled with string placeholders, because the semantic type list has no integer type. Those `INSERT`s will fail on a typed integer column.
+- **Generated values are templated.** Emails, names and companies come from fixed patterns, not a realistic data library. Values do not consider `CHECK` constraints or enum types.
+- The generate UI shows the HTTP status code, not the server's error message, when a request is rejected.
+
+## Project structure
+
+```
+app/
+  api/analyze/        POST /api/analyze
+  api/generate/       POST /api/generate (streaming)
+  api/auth/           NextAuth handler
+  dashboard/          generation history
+  login/              OAuth sign-in page
+components/           landing page, terminal UI, navigation
+lib/
+  sql-schema-parser.ts     CREATE TABLE -> tables / PKs / FKs
+  dependency-resolver.ts   Kahn's algorithm
+  schema-analysis.ts       parse + validate + Groq classification
+  generation-plan.ts       plan validation and row generation
+  identifier-safety.ts     identifier allowlist and quoting
+  rate-limit.ts            shared AI-call quota
+  groq.ts                  Groq client and response validation
+  __tests__/               Vitest unit tests
+prisma/schema.prisma       database schema
+```
+
+## Testing
+
+```bash
+npm test
+```
+
+The suite covers the SQL parser, dependency resolver (including cycles and diamond graphs), identifier safety, schema analysis, generation planning (including foreign-key integrity across multi-parent and deep chains) and the rate limiter. The Prisma and Groq boundaries are mocked; no test talks to a live database or the Groq API.
+
+## Deployment
+
+The app is set up for [Vercel](https://vercel.com).
+
+1. Add all environment variables from the table above in the project settings, and set `NEXTAUTH_URL` to your production URL.
+2. Register `<production-url>/api/auth/callback/github` (and `.../google`) on your OAuth apps.
+3. Run `npx prisma db push` against your production database before the first deploy, and again whenever `prisma/schema.prisma` changes.
+
+## License
+
+No license has been specified yet.
