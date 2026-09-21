@@ -102,6 +102,25 @@ export function analyzeStructure(rawSql: string): StructuralResult {
     }
   }
 
+  // Primary-key support is a purely structural fact, so it is checked here
+  // (before any quota reservation or AI call), not after the Groq round-trip.
+  for (const t of tables) {
+    if (t.hasCompositePrimaryKey) {
+      throw new SchemaAnalysisError(
+        `Table "${t.name}" has a composite primary key, which is not currently supported for generation.`,
+        'unsupported_primary_key',
+        422
+      );
+    }
+    if (t.primaryKey && t.primaryKey.kind === 'unsupported') {
+      throw new SchemaAnalysisError(
+        `Table "${t.name}" has a primary key column "${t.primaryKey.column}" of an unsupported type. Only integer and UUID primary keys are currently supported.`,
+        'unsupported_primary_key_type',
+        422
+      );
+    }
+  }
+
   const resolution = resolveGenerationOrder(toDependencyNodes(tables));
   if (!resolution.ok) {
     const issue = resolution.issues[0];
