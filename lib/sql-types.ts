@@ -42,7 +42,7 @@ export interface ColumnTypeInfo {
 /** Fits SMALLINT (max 32767) and every wider integer type. */
 const INTEGER_MAX_DEFAULT = 1000;
 /** Fits a signed TINYINT (max 127). */
-const TINYINT_MAX = 100;
+export const TINYINT_MAX = 100;
 
 /** Numbers inside the first (...) of a type, e.g. "decimal(10, 2)" -> [10, 2]. */
 function numericArgs(type: string): number[] {

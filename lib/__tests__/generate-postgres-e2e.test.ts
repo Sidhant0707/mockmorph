@@ -92,6 +92,31 @@ describe('generated SQL is accepted by real Postgres', () => {
     expect(bad.rows).toHaveLength(0);
   });
 
+  it('gives common column names (age, quantity, rating, year, count) sensible ranges', async () => {
+    const schema = `
+      CREATE TABLE stats (
+        id SERIAL PRIMARY KEY,
+        age INT,
+        quantity INT,
+        rating INT,
+        year INT,
+        count INT,
+        unrelated INT
+      );`;
+    const sql = await generateSql(schema, { rows: 200 });
+    await loadIntoPostgres(schema, sql);
+    expect(await count('stats')).toBe(200);
+    const outOfRange = await db.query(`
+      SELECT 1 FROM stats WHERE
+        age NOT BETWEEN 18 AND 90 OR
+        quantity NOT BETWEEN 1 AND 50 OR
+        rating NOT BETWEEN 1 AND 5 OR
+        year NOT BETWEEN 1990 AND 2026 OR
+        count NOT BETWEEN 0 AND 100
+    `);
+    expect(outOfRange.rows).toHaveLength(0);
+  });
+
   it('every common Postgres column type in one table', async () => {
     const schema = `
       CREATE TABLE customers (

@@ -357,3 +357,56 @@ describe('generateTableRows: values match the declared SQL type', () => {
     expect(rows.parent.map((r) => r.id)).toEqual(Array.from({ length: 15 }, (_, i) => i + 1));
   });
 });
+
+describe('generateTableRows: sensible ranges for common integer column names', () => {
+  /** Generates `rows` rows for a single-table schema and returns just the named column's values. */
+  function valuesOfNamed(columnName: string, sqlType: string, rows = 300): Array<string | number> {
+    const t = table('t', {
+      columns: ['id', columnName],
+      columnTypes: { id: 'pk', [columnName]: 'string' },
+      sqlTypes: { [columnName]: sqlType },
+    });
+    const plan = buildGenerationPlan(mapOf([t], ['t']), rows, LIMITS);
+    return runAll(new Map(), plan).t.map((r) => r[columnName]);
+  }
+
+  it('gives age a human range', () => {
+    expect(valuesOfNamed('age', 'INT').every((v) => (v as number) >= 18 && (v as number) <= 90)).toBe(true);
+  });
+
+  it('gives quantity a small positive range', () => {
+    expect(valuesOfNamed('quantity', 'INT').every((v) => (v as number) >= 1 && (v as number) <= 50)).toBe(true);
+  });
+
+  it('gives rating a 1-5 range', () => {
+    expect(valuesOfNamed('rating', 'INT').every((v) => (v as number) >= 1 && (v as number) <= 5)).toBe(true);
+  });
+
+  it('gives year and count sensible ranges too', () => {
+    expect(valuesOfNamed('year', 'INT').every((v) => (v as number) >= 1990 && (v as number) <= 2026)).toBe(true);
+    expect(valuesOfNamed('count', 'INT').every((v) => (v as number) >= 0 && (v as number) <= 100)).toBe(true);
+  });
+
+  it('matches by whole word, not substring — "discount" and "account_id" are not "count"', () => {
+    // Default range for a plain declared INT is 1-1000 (see the type-match tests above).
+    const discount = valuesOfNamed('discount', 'INT', 500);
+    expect(discount.some((v) => (v as number) > 100)).toBe(true);
+  });
+
+  it('matches a named word inside a snake_case or camelCase column name', () => {
+    expect(valuesOfNamed('user_age', 'INT').every((v) => (v as number) >= 18 && (v as number) <= 90)).toBe(true);
+    expect(valuesOfNamed('userAge', 'INT').every((v) => (v as number) >= 18 && (v as number) <= 90)).toBe(true);
+    expect(valuesOfNamed('order_quantity', 'INT').every((v) => (v as number) >= 1 && (v as number) <= 50)).toBe(true);
+  });
+
+  it('never exceeds the declared type limit, even when the named range would', () => {
+    // "year" (1990-2026) does not fit inside TINYINT's range (max 100 here), so this
+    // must fall back to TINYINT's own default range rather than emitting an out-of-range value.
+    expect(valuesOfNamed('year', 'TINYINT(4)').every((v) => (v as number) >= 1 && (v as number) <= 100)).toBe(true);
+  });
+
+  it('still fits a named range inside a narrower declared type when it does fit', () => {
+    // "rating" (1-5) fits comfortably inside TINYINT's range, so the named range still applies.
+    expect(valuesOfNamed('rating', 'TINYINT(4)').every((v) => (v as number) >= 1 && (v as number) <= 5)).toBe(true);
+  });
+});
