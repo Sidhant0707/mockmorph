@@ -64,6 +64,11 @@ model Generation {
   schema    String   @db.Text
   mockData  String   @db.Text
   createdAt DateTime @default(now())
+  /// One of: "completed" | "failed" | "cancelled". A String rather than a
+  /// native enum so this can be applied with a simple additive migration.
+  /// Added so a failed or client-cancelled generation is recorded as such
+  /// instead of indistinguishably alongside successful ones.
+  status    String   @default("completed")
 
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 }

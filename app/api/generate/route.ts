@@ -1,24 +1,38 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { getSessionUserId } from '@/lib/session';
+import { AnalysisError, GROQ_MODEL, MAX_SCHEMA_CHARS } from '@/lib/groq';
 import {
-  analyzeSchema,
-  AnalysisError,
-  GROQ_MODEL,
-  MAX_SCHEMA_CHARS,
-  normalizeSemanticMap,
-  type SemanticSchemaMap,
-  type SemanticType,
-} from '@/lib/groq';
+  analyzeStructure,
+  buildValidatedSemanticMap,
+  isPlausibleColumnTypeCache,
+  SchemaAnalysisError,
+  type ValidatedSemanticMap,
+} from '@/lib/schema-analysis';
+import { reserveAiCallQuota, refundAiCallQuota } from '@/lib/rate-limit';
+import {
+  buildGenerationPlan,
+  generateTableRows,
+  PlanValidationError,
+  type Dialect,
+  type PkPools,
+} from '@/lib/generation-plan';
+import { quoteIdentifier } from '@/lib/identifier-safety';
 
-type Dialect = 'postgres' | 'mysql';
 const DIALECTS: readonly Dialect[] = ['postgres', 'mysql'];
 
 /** Everything here comes from the client, so it is typed `unknown` until validated. */
 interface RequestBody {
   rawSchema?: unknown;
   config?: { rowCount?: unknown; dialect?: unknown };
-  semanticMap?: unknown;
+  /**
+   * Optional cached Groq classification from a prior /api/analyze call, in
+   * the shape { [table]: { [column]: semanticType } }. This is the ONLY
+   * thing a client can cache to skip AI work — there is no client-suppliable
+   * topology field. Table order, primary keys, and foreign keys are always
+   * recomputed locally from rawSchema on every request; see lib/schema-analysis.ts.
+   */
+  cachedColumnTypes?: unknown;
 }
 
 const LIMITS = {
@@ -53,142 +67,122 @@ function parseDialect(value: unknown): Dialect {
 }
 
 // ---------------------------------------------------------------------------
-// Value generation
-// ---------------------------------------------------------------------------
-
-interface ValueContext {
-  index: number;
-  parentMaxId: number;
-  dialect: Dialect;
-}
-
-const randomToken = (): string => Math.random().toString(36).substring(2, 9);
-
-/**
- * Typed as Record<SemanticType, ...>, so adding a new semantic type in lib/groq.ts
- * fails to compile here until a generator exists for it.
- */
-const VALUE_GENERATORS: Record<SemanticType, (ctx: ValueContext) => string | number> = {
-  email: ({ index }) => `'user${index}_${randomToken()}@obsidian.corp'`,
-  fullname: () => `'Operative ${randomToken().toUpperCase()}'`,
-  price: () => (Math.random() * 5000 + 0.01).toFixed(2),
-  product: ({ index }) => `'Cyber-Asset MK-${String(index).padStart(3, '0')}'`,
-  company: ({ index }) => `'Syndicate ${index} LLC'`,
-  phone: () => `'555-01${String(Math.floor(10 + Math.random() * 90)).padStart(2, '0')}'`,
-  date: ({ index }) => `'2026-05-${String(((index - 1) % 28) + 1).padStart(2, '0')}'`,
-  boolean: ({ dialect }) => {
-    const value = Math.random() > 0.5;
-    if (dialect === 'mysql') return value ? 1 : 0;
-    return value ? 'TRUE' : 'FALSE';
-  },
-  fk: ({ parentMaxId }) => (parentMaxId > 0 ? Math.floor(Math.random() * parentMaxId) + 1 : 1),
-  pk: ({ index }) => index,
-  string: ({ index }) => `'string_val_${index}'`,
-};
-
-// ---------------------------------------------------------------------------
 // Streaming
 // ---------------------------------------------------------------------------
 
 /** Thrown internally to unwind the generation loop when the client disconnects. */
 class StreamCancelledError extends Error {}
 
+type GenerationStatus = 'completed' | 'failed' | 'cancelled';
+
 interface GenerationOptions {
   userId: string;
   schema: string;
-  providedMap: SemanticSchemaMap | null;
+  map: ValidatedSemanticMap;
   requestedRows: number;
   dialect: Dialect;
+  usedCache: boolean;
 }
 
 function createGenerationStream(options: GenerationOptions): ReadableStream<Uint8Array> {
-  const { userId, schema, providedMap, requestedRows, dialect } = options;
+  const { userId, schema, map, requestedRows, dialect, usedCache } = options;
   const encoder = new TextEncoder();
   const lines: string[] = [];
   let cancelled = false;
+  let status: GenerationStatus = 'completed';
 
   return new ReadableStream<Uint8Array>({
     async start(controller) {
       const send = async (text: string, delay = 0): Promise<void> => {
         if (cancelled) throw new StreamCancelledError();
         if (delay > 0) await sleep(delay);
-        // The client may have left while we slept; enqueue() on a closed stream throws.
         if (cancelled) throw new StreamCancelledError();
         lines.push(text);
         controller.enqueue(encoder.encode(`${text}\n`));
       };
 
       try {
-        await send('-- [SYS] Initializing Hybrid LLM-Deterministic Edge Engine...', 50);
+        await send('-- [SYS] Initializing Local-First Dependency Engine...', 50);
+        await send(
+          usedCache
+            ? '-- [SYS] Using cached semantic classification. No AI call for this request.'
+            : `-- [AI] ${GROQ_MODEL} (Groq) classified column semantics.`,
+          50
+        );
+        await send(
+          `-- [LOCAL] Kahn's algorithm resolved dependency order: ${map.topology.join(' -> ')}`,
+          50
+        );
 
-        // Use the client's cached map when valid, otherwise ask the model.
-        let schemaMap: SemanticSchemaMap;
-        if (providedMap) {
-          await send('-- [SYS] Pre-verified Semantic Map received. Bypassing AI...', 50);
-          schemaMap = providedMap;
-        } else {
-          await send(`-- [SYS] Handshake with ${GROQ_MODEL} (Groq LPU) established.`, 50);
-          await send('-- [AI] Analyzing schema semantics on the fly...', 100);
-          schemaMap = await analyzeSchema(schema);
-        }
-
-        const { topology, tables } = schemaMap;
-        await send(`-- [AI] Topology Locked: ${topology.join(' -> ')}`, 50);
-        await send(`-- [EDGE] Executing Kahn's Algorithm chunking for ${dialect.toUpperCase()}...`, 100);
+        // The full generation plan — row counts per table, and a check that
+        // every FK actually targets a primary key ordered before it — is
+        // built and validated BEFORE any row is generated. A structural
+        // problem is impossible to discover mid-stream by construction.
+        const plan = buildGenerationPlan(map, requestedRows, {
+          baseParentRows: LIMITS.BASE_PARENT_ROWS,
+          maxRows: LIMITS.MAX_ROWS,
+          minRows: LIMITS.MIN_ROWS,
+        });
+        await send(`-- [LOCAL] Generation plan validated for ${dialect.toUpperCase()}.`, 100);
         await send('', 50);
 
         let totalGenerated = 0;
-        let parentMaxId: number = LIMITS.BASE_PARENT_ROWS;
+        const pkPools: PkPools = new Map();
 
-        for (let t = 0; t < topology.length; t++) {
-          // normalizeSemanticMap guarantees every topology entry exists in `tables` with >= 1 column.
-          const tableName = topology[t];
-          const columns = tables[tableName];
-          const columnNames = Object.keys(columns);
+        for (const tablePlan of plan.tables) {
+          const { table, rowCount } = tablePlan;
+          const columnList = table.columns.map((c) => quoteIdentifier(c, dialect)).join(', ');
+          await send(`INSERT INTO ${quoteIdentifier(table.name, dialect)} (${columnList}) VALUES`, 50);
 
-          const isLastTable = t === topology.length - 1;
-          const rowsToGenerate = isLastTable
-            ? Math.max(1, requestedRows - totalGenerated)
-            : LIMITS.BASE_PARENT_ROWS;
-
-          await send(`INSERT INTO ${tableName} (${columnNames.join(', ')}) VALUES`, 50);
-
-          for (let row = 1; row <= rowsToGenerate; row++) {
-            const context: ValueContext = { index: row, parentMaxId, dialect };
-            const values = columnNames.map((name) => VALUE_GENERATORS[columns[name]](context));
-            const terminator = row === rowsToGenerate ? ';' : ',';
+          let rowIndex = 0;
+          for (const row of generateTableRows(tablePlan, dialect, pkPools)) {
+            rowIndex++;
+            const values = table.columns.map((c) => row[c]);
+            const terminator = rowIndex === rowCount ? ';' : ',';
             const delay = totalGenerated < STREAM.MAX_ANIMATED_ROWS ? STREAM.ROW_DELAY_MS : 0;
             await send(`  (${values.join(', ')})${terminator}`, delay);
             totalGenerated++;
           }
 
-          parentMaxId = rowsToGenerate;
           await send('', 20);
         }
 
+        // Every FK value came from an actual generated parent PK pool (see
+        // lib/generation-plan.ts) — this line is now a true statement about
+        // what just happened, not a fixed string printed regardless of it.
         await send(
-          `-- [COMPLETE] ${totalGenerated} semantic rows generated. 100% Referential Integrity maintained.`,
+          `-- [COMPLETE] ${totalGenerated} rows generated across ${plan.tables.length} tables. Every foreign key resolved against its actual referenced parent's generated primary keys.`,
           50
         );
-
-        // Saving history is best-effort: the user already has their data, so a DB
-        // hiccup should be a warning, not a "fatal error" printed under a finished result.
-        try {
-          await prisma.generation.create({
-            data: { userId, schema, mockData: `${lines.join('\n')}\n` },
-          });
-        } catch (error) {
-          console.error('[generate] failed to save generation:', error);
-          await send('-- [WARN] Output generated, but it could not be saved to your history.');
-        }
       } catch (error) {
-        if (!(error instanceof StreamCancelledError)) {
+        if (error instanceof StreamCancelledError) {
+          status = 'cancelled';
+        } else {
+          status = 'failed';
           console.error('[generate] stream failed:', error);
-          const message = error instanceof AnalysisError ? error.message : 'Unexpected internal error';
+          const message =
+            error instanceof AnalysisError || error instanceof PlanValidationError || error instanceof SchemaAnalysisError
+              ? error.message
+              : 'Unexpected internal error';
           await send(`-- [FATAL ERROR] Core processing failure: ${message}`).catch(() => undefined);
         }
       } finally {
-        // After cancel() the stream is already closed and close() would throw.
+        // Saving history is best-effort in the sense that a DB hiccup while
+        // saving becomes a warning, not a fatal error under a finished
+        // result — but a failed or cancelled run is now recorded as such,
+        // never silently stored as if it had completed successfully.
+        try {
+          await prisma.generation.create({
+            data: { userId, schema, mockData: `${lines.join('\n')}\n`, status },
+          });
+        } catch (error) {
+          console.error('[generate] failed to save generation:', error);
+          if (!cancelled) {
+            await send('-- [WARN] Output generated, but it could not be saved to your history.').catch(
+              () => undefined
+            );
+          }
+        }
         if (!cancelled) controller.close();
       }
     },
@@ -203,8 +197,11 @@ function createGenerationStream(options: GenerationOptions): ReadableStream<Uint
 // ---------------------------------------------------------------------------
 
 export async function POST(req: Request) {
+  let quotaReserved = false;
+  let userId: string | null = null;
+
   try {
-    const userId = await getSessionUserId();
+    userId = await getSessionUserId();
     if (!userId) {
       return NextResponse.json({ error: 'Authentication required' }, { status: 401 });
     }
@@ -213,9 +210,12 @@ export async function POST(req: Request) {
     if (typeof body !== 'object' || body === null) {
       return NextResponse.json({ error: 'Request body must be valid JSON' }, { status: 400 });
     }
-    const { rawSchema, config, semanticMap } = body as RequestBody;
+    const { rawSchema, config, cachedColumnTypes } = body as RequestBody;
 
     const schema = typeof rawSchema === 'string' ? rawSchema.trim() : '';
+    if (!schema) {
+      return NextResponse.json({ error: 'A SQL schema is required' }, { status: 400 });
+    }
     if (schema.length > MAX_SCHEMA_CHARS) {
       return NextResponse.json(
         { error: `Schema is too large (max ${MAX_SCHEMA_CHARS} characters)` },
@@ -223,22 +223,48 @@ export async function POST(req: Request) {
       );
     }
 
-    // The map is client-supplied, so it goes through the same validation as model output.
-    // An invalid map is ignored and we fall back to AI analysis.
-    const providedMap = normalizeSemanticMap(semanticMap);
-    if (semanticMap != null && !providedMap) {
-      console.warn('[generate] ignoring invalid semanticMap from client');
+    // Local structural validation FIRST — no AI quota is touched for a
+    // schema that's malformed, cyclic, references a nonexistent table, or
+    // uses an unsupported primary-key type.
+    analyzeStructure(schema);
+
+    // This is the fix for the rate-limit gap: an AI call only happens (and
+    // therefore only costs a quota slot) when no plausible cached
+    // classification was supplied. Both /api/analyze and this fallback path
+    // now share the exact same quota via lib/rate-limit.ts.
+    const usedCache = isPlausibleColumnTypeCache(cachedColumnTypes);
+    if (!usedCache) {
+      const quota = await reserveAiCallQuota(userId);
+      if (quota.status === 'no_user') {
+        return NextResponse.json({ error: 'User not found' }, { status: 404 });
+      }
+      if (quota.status === 'limited') {
+        return NextResponse.json(
+          {
+            error:
+              'AI analysis rate limit exceeded. Run /api/analyze first and reuse its result, or wait an hour.',
+          },
+          { status: 429 }
+        );
+      }
+      quotaReserved = true;
     }
-    if (!providedMap && !schema) {
-      return NextResponse.json({ error: 'Provide a SQL schema or a semantic map' }, { status: 400 });
+
+    let map: ValidatedSemanticMap;
+    try {
+      map = await buildValidatedSemanticMap(schema, cachedColumnTypes);
+    } catch (error) {
+      if (quotaReserved) await refundAiCallQuota(userId);
+      throw error;
     }
 
     const stream = createGenerationStream({
       userId,
       schema,
-      providedMap,
+      map,
       requestedRows: parseRowCount(config?.rowCount),
       dialect: parseDialect(config?.dialect),
+      usedCache,
     });
 
     return new Response(stream, {
@@ -249,6 +275,15 @@ export async function POST(req: Request) {
     });
   } catch (error) {
     console.error('[generate] request failed:', error);
+    if (error instanceof SchemaAnalysisError) {
+      return NextResponse.json({ error: error.message, kind: error.kind }, { status: error.httpStatus });
+    }
+    if (error instanceof PlanValidationError) {
+      return NextResponse.json({ error: error.message, kind: error.kind }, { status: 422 });
+    }
+    if (error instanceof AnalysisError) {
+      return NextResponse.json({ error: error.message }, { status: error.httpStatus });
+    }
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }

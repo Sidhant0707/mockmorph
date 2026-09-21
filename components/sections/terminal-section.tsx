@@ -50,11 +50,11 @@ function parseTerminalLine(text: string, runId: number): TerminalLine {
     };
   if (trimmed.startsWith("-- [AI]"))
     return { id, type: "ai", content: trimmed.replace("-- [AI]", "").trim() };
-  if (trimmed.startsWith("-- [EDGE]"))
+  if (trimmed.startsWith("-- [LOCAL]"))
     return {
       id,
       type: "edge",
-      content: trimmed.replace("-- [EDGE]", "").trim(),
+      content: trimmed.replace("-- [LOCAL]", "").trim(),
     };
   if (trimmed.startsWith("-- [COMPLETE]"))
     return {
@@ -238,7 +238,11 @@ CREATE TABLE orders (
         body: JSON.stringify({
           rawSchema: userSchemaCode,
           config: { rowCount: expectedRows, dialect: sqlDialect },
-          semanticMap: schemaMapping,
+          // Table order, primary keys, and foreign keys are always
+          // recomputed locally by the server from rawSchema — only the
+          // AI's column-level semantic classification is worth caching to
+          // skip a network call, so that's all that's sent here.
+          cachedColumnTypes: schemaMapping?.tables,
         }),
         signal: abortController.signal,
       });
