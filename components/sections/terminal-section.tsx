@@ -9,6 +9,7 @@ import React, {
 } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useRouter } from "next/navigation";
+import { extractErrorMessage } from "@/lib/error-messages";
 import {
   HiPlay,
   HiArrowPath,
@@ -253,7 +254,10 @@ CREATE TABLE orders (
         return;
       }
 
-      if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+      if (!response.ok) {
+        const bodyText = await response.text().catch(() => "");
+        throw new Error(extractErrorMessage(bodyText, `HTTP error! status: ${response.status}`));
+      }
       if (!response.body) throw new Error("No readable stream available.");
 
       const reader = response.body.getReader();
