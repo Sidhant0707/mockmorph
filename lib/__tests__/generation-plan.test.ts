@@ -20,8 +20,11 @@ function table(
     sqlTypes?: Record<string, string>;
     primaryKey?: ValidatedTable['primaryKey'];
     foreignKeys?: ValidatedTable['foreignKeys'];
+    /** Columns declared NOT NULL (the primary key always is). Every other column is nullable. */
+    notNull?: string[];
   }
 ): ValidatedTable {
+  const primaryKey = opts.primaryKey ?? { column: 'id', kind: 'integer' as const };
   return {
     name,
     columns: opts.columns,
@@ -29,7 +32,10 @@ function table(
     columnInfo: Object.fromEntries(
       Object.entries(opts.sqlTypes ?? {}).map(([col, type]): [string, ColumnTypeInfo] => [col, classifyColumnType(type)])
     ),
-    primaryKey: opts.primaryKey ?? { column: 'id', kind: 'integer' },
+    notNull: Object.fromEntries(
+      opts.columns.map((col) => [col, col === primaryKey.column || (opts.notNull ?? []).includes(col)])
+    ),
+    primaryKey,
     foreignKeys: opts.foreignKeys ?? [],
   };
 }
@@ -85,6 +91,7 @@ describe('buildGenerationPlan validation', () => {
       columns: ['id', 'user_id'],
       columnTypes: { id: 'pk', user_id: 'fk' },
       foreignKeys: [{ column: 'user_id', referencesTable: 'users', referencesColumn: 'id' }],
+      notNull: ['user_id'],
     });
     // topology is deliberately backwards
     expect(() => buildGenerationPlan(mapOf([users, orders], ['orders', 'users']), 50, LIMITS)).toThrow(
@@ -408,5 +415,261 @@ describe('generateTableRows: sensible ranges for common integer column names', (
   it('still fits a named range inside a narrower declared type when it does fit', () => {
     // "rating" (1-5) fits comfortably inside TINYINT's range, so the named range still applies.
     expect(valuesOfNamed('rating', 'TINYINT(4)').every((v) => (v as number) >= 1 && (v as number) <= 5)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Self-referencing foreign keys
+// ---------------------------------------------------------------------------
+
+describe('buildGenerationPlan: self-referencing foreign keys', () => {
+  const selfFk = (column: string, referencesColumn = 'id') => ({
+    column,
+    referencesTable: 'employees',
+    referencesColumn,
+  });
+  const employees = (foreignKeys: ValidatedTable['foreignKeys'], primaryKey?: ValidatedTable['primaryKey']) =>
+    table('employees', {
+      columns: ['id', 'manager_id'],
+      columnTypes: { id: 'pk', manager_id: 'fk' },
+      foreignKeys,
+      primaryKey,
+    });
+
+  it('accepts a table that references its own primary key', () => {
+    const plan = buildGenerationPlan(mapOf([employees([selfFk('manager_id')])], ['employees']), 50, LIMITS);
+    expect(plan.tables.map((t) => t.table.name)).toEqual(['employees']);
+    expect(plan.tables[0].rowCount).toBe(50);
+  });
+
+  it('accepts a self-reference next to a normal foreign key to an earlier parent', () => {
+    const departments = table('departments', { columns: ['id'], columnTypes: { id: 'pk' } });
+    const staff = table('employees', {
+      columns: ['id', 'manager_id', 'department_id'],
+      columnTypes: { id: 'pk', manager_id: 'fk', department_id: 'fk' },
+      foreignKeys: [selfFk('manager_id'), { column: 'department_id', referencesTable: 'departments', referencesColumn: 'id' }],
+    });
+    const plan = buildGenerationPlan(mapOf([departments, staff], ['departments', 'employees']), 100, LIMITS);
+    expect(plan.tables.map((t) => t.table.name)).toEqual(['departments', 'employees']);
+  });
+
+  it('rejects a self-reference to a column that is not the primary key', () => {
+    const map = mapOf([employees([selfFk('manager_id', 'name')])], ['employees']);
+    expect(() => buildGenerationPlan(map, 50, LIMITS)).toThrow(/not that table's primary key/);
+    try {
+      buildGenerationPlan(map, 50, LIMITS);
+    } catch (error) {
+      expect((error as PlanValidationError).kind).toBe('unsupported_fk_target');
+    }
+  });
+
+  it('rejects a self-reference on a table that has no primary key', () => {
+    const noPk = { ...employees([selfFk('manager_id')]), primaryKey: null };
+    expect(() => buildGenerationPlan(mapOf([noPk], ['employees']), 50, LIMITS)).toThrow(PlanValidationError);
+  });
+
+  it('still rejects a two-table cycle, whichever way the topology is ordered', () => {
+    const a = table('a', {
+      columns: ['id', 'b_id'],
+      columnTypes: { id: 'pk', b_id: 'fk' },
+      foreignKeys: [{ column: 'b_id', referencesTable: 'b', referencesColumn: 'id' }],
+      notNull: ['b_id'],
+    });
+    const b = table('b', {
+      columns: ['id', 'a_id'],
+      columnTypes: { id: 'pk', a_id: 'fk' },
+      foreignKeys: [{ column: 'a_id', referencesTable: 'a', referencesColumn: 'id' }],
+      notNull: ['a_id'],
+    });
+    expect(() => buildGenerationPlan(mapOf([a, b], ['a', 'b']), 50, LIMITS)).toThrow(/not ordered before/);
+    expect(() => buildGenerationPlan(mapOf([a, b], ['b', 'a']), 50, LIMITS)).toThrow(/not ordered before/);
+  });
+
+  it('still rejects a cycle that involves a table which also references itself', () => {
+    const a = table('a', {
+      columns: ['id', 'parent_id', 'b_id'],
+      columnTypes: { id: 'pk', parent_id: 'fk', b_id: 'fk' },
+      foreignKeys: [
+        { column: 'parent_id', referencesTable: 'a', referencesColumn: 'id' },
+        { column: 'b_id', referencesTable: 'b', referencesColumn: 'id' },
+      ],
+      notNull: ['b_id'],
+    });
+    const b = table('b', {
+      columns: ['id', 'a_id'],
+      columnTypes: { id: 'pk', a_id: 'fk' },
+      foreignKeys: [{ column: 'a_id', referencesTable: 'a', referencesColumn: 'id' }],
+      notNull: ['a_id'],
+    });
+    // The self-edge on `a` must not excuse a's other, real ordering constraint.
+    expect(() => buildGenerationPlan(mapOf([a, b], ['a', 'b']), 50, LIMITS)).toThrow(/a\.b_id references "b"/);
+    expect(() => buildGenerationPlan(mapOf([a, b], ['b', 'a']), 50, LIMITS)).toThrow(/b\.a_id references "a"/);
+  });
+
+  it('accepts a nullable foreign key to a later table, and generates NULL for it', () => {
+    const a = table('a', {
+      columns: ['id', 'b_id'],
+      columnTypes: { id: 'pk', b_id: 'fk' },
+      foreignKeys: [{ column: 'b_id', referencesTable: 'b', referencesColumn: 'id' }],
+    });
+    const b = table('b', {
+      columns: ['id', 'a_id'],
+      columnTypes: { id: 'pk', a_id: 'fk' },
+      foreignKeys: [{ column: 'a_id', referencesTable: 'a', referencesColumn: 'id' }],
+      notNull: ['a_id'],
+    });
+    const plan = buildGenerationPlan(mapOf([a, b], ['a', 'b']), 50, LIMITS);
+    const rows = runAll(new Map() as PkPools, plan);
+    expect(rows.a.every((r) => r.b_id === 'NULL')).toBe(true);
+    const aIds = new Set(rows.a.map((r) => r.id));
+    expect(rows.b.every((r) => aIds.has(r.a_id as number))).toBe(true);
+  });
+});
+
+describe('generateTableRows: self-referencing foreign key invariants', () => {
+  type Row = Record<string, string | number>;
+
+  interface SelfTableOptions {
+    pkKind?: 'integer' | 'uuid';
+    /** Column order as declared; the primary key is always called "id". */
+    columns?: string[];
+    selfFks?: string[];
+    notNull?: string[];
+  }
+
+  function selfTable(opts: SelfTableOptions = {}): ValidatedTable {
+    const columns = opts.columns ?? ['id', 'name', 'manager_id'];
+    const selfFks = opts.selfFks ?? ['manager_id'];
+    return table('employees', {
+      columns,
+      columnTypes: Object.fromEntries(
+        columns.map((c) => [c, c === 'id' ? 'pk' : selfFks.includes(c) ? 'fk' : 'fullname'])
+      ) as ValidatedTable['columnTypes'],
+      sqlTypes: { name: 'TEXT' },
+      primaryKey: { column: 'id', kind: opts.pkKind ?? 'integer' },
+      foreignKeys: selfFks.map((column) => ({ column, referencesTable: 'employees', referencesColumn: 'id' })),
+      notNull: opts.notNull,
+    });
+  }
+
+  function generate(t: ValidatedTable, rows: number, dialect: Dialect = 'postgres') {
+    const pools: PkPools = new Map();
+    const plan = buildGenerationPlan(mapOf([t], ['employees']), rows, LIMITS);
+    return { rows: runAll(pools, plan, dialect).employees as Row[], pools };
+  }
+
+  /** The invariants the whole feature rests on; throws (via expect) on the first violation. */
+  function expectSelfFkInvariants(rows: Row[], selfFks: string[], notNull: string[]): void {
+    const earlier = new Set<string | number>();
+    rows.forEach((row, index) => {
+      for (const col of selfFks) {
+        const value = row[col];
+        const label = `row ${index + 1}, column ${col} = ${value}`;
+        if (value === 'NULL') {
+          expect(notNull.includes(col), `NULL in NOT NULL column: ${label}`).toBe(false);
+        } else if (index === 0) {
+          // The first row has no earlier row to point at: only a NOT NULL column may be filled, and only by itself.
+          expect(notNull.includes(col), `first row of a nullable column must be NULL: ${label}`).toBe(true);
+          expect(value, label).toBe(row.id);
+        } else {
+          expect(earlier.has(value), `not an earlier row's key: ${label}`).toBe(true);
+          expect(value, `points at itself: ${label}`).not.toBe(row.id);
+        }
+      }
+      earlier.add(row.id);
+    });
+  }
+
+  const ITERATIONS = 100;
+  const randomRowCount = () => 1 + Math.floor(Math.random() * 80);
+
+  for (const pkKind of ['integer', 'uuid'] as const) {
+    for (const notNullFk of [false, true]) {
+      for (const columns of [
+        ['id', 'name', 'manager_id'],
+        ['manager_id', 'name', 'id'], // FK declared before the primary key
+        ['name', 'manager_id', 'id'],
+      ]) {
+        it(`${pkKind} pk, ${notNullFk ? 'NOT NULL' : 'nullable'} self-FK, columns [${columns.join(', ')}]: ${ITERATIONS} random runs`, () => {
+          const notNull = notNullFk ? ['manager_id'] : [];
+          for (let i = 0; i < ITERATIONS; i++) {
+            const { rows, pools } = generate(selfTable({ pkKind, columns, notNull }), randomRowCount());
+            expectSelfFkInvariants(rows, ['manager_id'], notNull);
+            expect(pools.get('employees')).toEqual(rows.map((r) => (typeof r.id === 'string' ? r.id.slice(1, -1) : r.id)));
+          }
+        });
+      }
+    }
+  }
+
+  it('a nullable self-FK gives the first row NULL and keeps about 20% of the rest NULL, the rest are real parents', () => {
+    const { rows } = generate(selfTable(), 5000);
+    const rest = rows.slice(1);
+    const nullShare = rest.filter((r) => r.manager_id === 'NULL').length / rest.length;
+    expect(nullShare).toBeGreaterThan(0.15);
+    expect(nullShare).toBeLessThan(0.25);
+    expect(rest.some((r) => r.manager_id !== 'NULL')).toBe(true);
+  });
+
+  it('a NOT NULL self-FK never emits NULL, and exactly one row (the first) references itself', () => {
+    const { rows } = generate(selfTable({ notNull: ['manager_id'] }), 2000);
+    expect(rows.filter((r) => r.manager_id === 'NULL')).toHaveLength(0);
+    expect(rows.filter((r) => r.manager_id === r.id).map((r) => r.id)).toEqual([1]);
+  });
+
+  it('a single-row table is valid: NULL if nullable, itself if NOT NULL', () => {
+    expect(generate(selfTable(), 1).rows[0].manager_id).toBe('NULL');
+    expect(generate(selfTable({ notNull: ['manager_id'] }), 1).rows[0]).toMatchObject({ id: 1, manager_id: 1 });
+  });
+
+  it('treats a column with no NOT NULL information as NOT NULL, so it can never receive NULL', () => {
+    const t = { ...selfTable(), notNull: {} };
+    const { rows } = generate(t, 200);
+    expect(rows.filter((r) => r.manager_id === 'NULL')).toHaveLength(0);
+  });
+
+  it('handles several self-FKs on one table independently (manager_id nullable, mentor_id NOT NULL)', () => {
+    const columns = ['id', 'manager_id', 'name', 'mentor_id'];
+    const notNull = ['mentor_id'];
+    for (let i = 0; i < ITERATIONS; i++) {
+      const { rows } = generate(selfTable({ columns, selfFks: ['manager_id', 'mentor_id'], notNull }), randomRowCount());
+      expectSelfFkInvariants(rows, ['manager_id', 'mentor_id'], notNull);
+    }
+  });
+
+  it('is the same for the mysql dialect', () => {
+    const { rows } = generate(selfTable({ pkKind: 'uuid', notNull: ['manager_id'] }), 100, 'mysql');
+    expectSelfFkInvariants(rows, ['manager_id'], ['manager_id']);
+  });
+
+  it('a self-FK next to an FK to another parent: the other FK is unchanged (real parent key, never NULL)', () => {
+    const departments = table('departments', { columns: ['id'], columnTypes: { id: 'pk' } });
+    const staff = table('employees', {
+      columns: ['id', 'department_id', 'manager_id'],
+      columnTypes: { id: 'pk', department_id: 'fk', manager_id: 'fk' },
+      foreignKeys: [
+        { column: 'department_id', referencesTable: 'departments', referencesColumn: 'id' },
+        { column: 'manager_id', referencesTable: 'employees', referencesColumn: 'id' },
+      ],
+    });
+    for (let i = 0; i < ITERATIONS; i++) {
+      const pools: PkPools = new Map();
+      const plan = buildGenerationPlan(mapOf([departments, staff], ['departments', 'employees']), randomRowCount() + 15, LIMITS);
+      const rows = runAll(pools, plan);
+      expectSelfFkInvariants(rows.employees as Row[], ['manager_id'], []);
+      const departmentIds = new Set(pools.get('departments'));
+      for (const row of rows.employees) expect(departmentIds.has(row.department_id as number)).toBe(true);
+    }
+  });
+
+  it('a nullable non-self foreign key still never receives NULL', () => {
+    const users = table('users', { columns: ['id'], columnTypes: { id: 'pk' } });
+    const orders = table('orders', {
+      columns: ['id', 'user_id'],
+      columnTypes: { id: 'pk', user_id: 'fk' },
+      foreignKeys: [{ column: 'user_id', referencesTable: 'users', referencesColumn: 'id' }],
+    });
+    const rows = runAll(new Map(), buildGenerationPlan(mapOf([users, orders], ['users', 'orders']), 300, LIMITS));
+    expect(rows.orders.filter((r) => r.user_id === 'NULL')).toHaveLength(0);
   });
 });

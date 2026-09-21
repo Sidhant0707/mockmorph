@@ -35,6 +35,11 @@ export interface ParsedColumn {
   rawType: string;
   isPrimaryKey: boolean;
   isForeignKey: boolean;
+  /**
+   * True for a column-level NOT NULL and for every primary-key column (implicitly not null).
+   * Only what the CREATE TABLE statement itself says: a NOT NULL added later by ALTER TABLE is not seen.
+   */
+  notNull: boolean;
 }
 
 export interface ParsedTable {
@@ -297,7 +302,15 @@ export function parseSchema(rawSql: string): ParseResult {
         });
       }
 
-      columns.push({ name: colName, rawType, isPrimaryKey: isInlinePk, isForeignKey });
+      // A missed NOT NULL would make a NULL end up in a NOT NULL column, whereas a NOT NULL that is
+      // really just text inside a DEFAULT only makes the column look stricter than it is, which is harmless.
+      const notNull = /\bnot\s+null\b/.test(restLower);
+      columns.push({ name: colName, rawType, isPrimaryKey: isInlinePk, isForeignKey, notNull });
+    }
+
+    // Primary-key columns are implicitly NOT NULL, whether the key was declared inline or at table level.
+    for (const col of columns) {
+      if (pkColumns.includes(col.name)) col.notNull = true;
     }
 
     let primaryKey: ParsedTable['primaryKey'] = null;

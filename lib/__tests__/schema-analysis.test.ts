@@ -23,10 +23,30 @@ describe('analyzeStructure', () => {
     expect(() => analyzeStructure('not sql at all')).toThrow(SchemaAnalysisError);
   });
 
+  it('accepts a cycle that a nullable foreign key can break, and warns that the column is generated as NULL', () => {
+    const { order, warnings } = analyzeStructure(`
+      CREATE TABLE a (id SERIAL PRIMARY KEY, b_id INTEGER NOT NULL REFERENCES b(id));
+      CREATE TABLE b (id SERIAL PRIMARY KEY, a_id INTEGER REFERENCES a(id));
+    `);
+    expect(order).toEqual(['b', 'a']); // the NOT NULL edge decides the order
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('b.a_id is nullable');
+  });
+
+  it('treats a foreign key on a column with no NOT NULL information as a hard edge', () => {
+    // Table-level FK on a column that is not declared: nullability is unknown, so the cycle stays an error.
+    expect(() =>
+      analyzeStructure(`
+        CREATE TABLE a (id SERIAL PRIMARY KEY, FOREIGN KEY (b_id) REFERENCES b(id));
+        CREATE TABLE b (id SERIAL PRIMARY KEY, a_id INTEGER NOT NULL REFERENCES a(id));
+      `)
+    ).toThrow(/Circular foreign-key dependency/);
+  });
+
   it('throws with kind "circular_dependency" for a cyclic schema', () => {
     const cyclic = `
-      CREATE TABLE a (id SERIAL PRIMARY KEY, b_id INTEGER REFERENCES b(id));
-      CREATE TABLE b (id SERIAL PRIMARY KEY, a_id INTEGER REFERENCES a(id));
+      CREATE TABLE a (id SERIAL PRIMARY KEY, b_id INTEGER NOT NULL REFERENCES b(id));
+      CREATE TABLE b (id SERIAL PRIMARY KEY, a_id INTEGER NOT NULL REFERENCES a(id));
     `;
     try {
       analyzeStructure(cyclic);

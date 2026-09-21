@@ -6,8 +6,9 @@ Table structure (order, primary keys, foreign keys) is worked out **locally** by
 
 ## Features
 
-- **Local dependency resolution.** Foreign-key relationships are parsed from your SQL and ordered with Kahn's algorithm, so parent tables are always inserted before their children. Cycles and foreign keys pointing at missing tables are rejected before any row is generated.
+- **Local dependency resolution.** Foreign-key relationships are parsed from your SQL and ordered with Kahn's algorithm, so parent tables are always inserted before their children. Foreign keys pointing at missing tables, and cycles between tables in which every foreign key is `NOT NULL`, are rejected before any row is generated. A cycle that a nullable foreign key can break is accepted: that column is generated as `NULL` (its parent is created later) and the analysis reports a warning.
 - **Correct foreign keys.** Every table keeps a pool of the primary keys it generated. A foreign key picks its value from the pool of the table its `REFERENCES` clause names, however many tables sit in between.
+- **Self-referencing foreign keys.** A table can reference its own primary key (for example `employees.manager_id REFERENCES employees(id)`), with integer or UUID keys, inline or table-level, and any number of such columns per table. A row may only point at a row generated earlier in the same table, so the data is always a valid hierarchy with no cycles. A nullable column gets `NULL` for the first row (a root) and for about a fifth of the rest; a `NOT NULL` column makes the first row reference itself, which PostgreSQL accepts but has not been verified on MySQL.
 - **Integer and UUID primary keys.** Integer keys are sequential; UUID keys are real random UUIDs.
 - **Streaming output.** Results stream to the terminal-style UI as they are generated. Copy them or download as `.sql`.
 - **AI semantic labels, with overrides.** Analyze a schema once, adjust any column's type in the UI, and reuse that classification without spending another AI call.
@@ -19,7 +20,7 @@ Table structure (order, primary keys, foreign keys) is worked out **locally** by
 1. `lib/sql-schema-parser.ts` parses `CREATE TABLE` statements into tables, columns, primary keys and foreign keys.
 2. `lib/dependency-resolver.ts` runs Kahn's algorithm over the foreign-key graph to get the generation order.
 3. `lib/schema-analysis.ts` combines both, validates identifiers and primary-key support, and asks Groq for column semantic types (unless a cached classification is supplied).
-4. `lib/generation-plan.ts` validates the full plan (every foreign key must target a primary key that is generated earlier) and then produces the rows.
+4. `lib/generation-plan.ts` validates the full plan (every foreign key must target a primary key, generated earlier or, for a self-reference, from rows of the same table generated earlier) and then produces the rows.
 5. `app/api/generate/route.ts` streams the `INSERT` statements and saves the run to the database.
 
 Steps 1–2 run on every request. The client cannot supply table order, keys or relationships.
@@ -135,7 +136,7 @@ Streams `INSERT` statements as plain text.
 ### Limits
 
 - Schemas are limited to 50,000 characters.
-- AI calls are limited to **5 per hour per user**, shared by `/api/analyze` and by `/api/generate` when it has to call Groq itself (no `cachedColumnTypes`). Schemas that can never be generated (cycles, missing tables, unsupported keys) are rejected before any AI call or quota use.
+- AI calls are limited to **5 per hour per user**, shared by `/api/analyze` and by `/api/generate` when it has to call Groq itself (no `cachedColumnTypes`). Schemas that can never be generated (cycles of `NOT NULL` foreign keys, missing tables, unsupported keys) are rejected before any AI call or quota use.
 - Row distribution: every table except the last one in dependency order gets 15 rows; the last table gets the remainder of the requested total (at least 1). With many tables the total can exceed the requested count.
 
 ## Supported SQL
@@ -145,6 +146,7 @@ Supported:
 - `CREATE TABLE [IF NOT EXISTS] name (...)`
 - Column-level `PRIMARY KEY`, `REFERENCES table(col)`, `NOT NULL`, `UNIQUE`, `DEFAULT`
 - Table-level `PRIMARY KEY (col)` and `FOREIGN KEY (col) REFERENCES table(col)`
+- Foreign keys that reference the table's own primary key (self-references)
 - Integer primary keys (`INT`, `INTEGER`, `SMALLINT`, `BIGINT`, `SERIAL`, `BIGSERIAL`, `SMALLSERIAL`) and `UUID` primary keys
 - Quoted identifiers (`"name"`, `` `name` ``)
 
@@ -159,7 +161,6 @@ Not supported yet:
 
 These are open issues rather than design choices:
 
-- **Self-referencing foreign keys** (for example `employees.manager_id REFERENCES employees(id)`) are rejected.
 - **A primary key that is also a foreign key** (one-to-one extension tables) can generate foreign-key violations.
 - **Plain integer columns** (such as `quantity` or `stock`) are filled with string placeholders, because the semantic type list has no integer type. Those `INSERT`s will fail on a typed integer column.
 - **Generated values are templated.** Emails, names and companies come from fixed patterns, not a realistic data library. Values do not consider `CHECK` constraints or enum types.
@@ -193,7 +194,7 @@ prisma/schema.prisma       database schema
 npm test
 ```
 
-The suite covers the SQL parser, dependency resolver (including cycles and diamond graphs), identifier safety, schema analysis, generation planning (including foreign-key integrity across multi-parent and deep chains) and the rate limiter. The Prisma and Groq boundaries are mocked; no test talks to a live database or the Groq API.
+The suite covers the SQL parser, dependency resolver (including cycles and diamond graphs), identifier safety, schema analysis, generation planning (including foreign-key integrity across multi-parent and deep chains and self-referencing keys) and the rate limiter. The Prisma, session and Groq boundaries are mocked, and the Groq API is never called. The end-to-end tests call the real `POST /api/generate` handler and run the SQL it streams in a real PostgreSQL engine (PGlite, in-process), so no external database is needed; generated MySQL output is not executed against a MySQL server.
 
 ## Deployment
 

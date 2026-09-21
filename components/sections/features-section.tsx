@@ -18,7 +18,7 @@ const features = [
   },
   {
     heading: "Locally Verified Dependency Order",
-    text: "Table and foreign-key relationships are parsed from your SQL and topologically sorted with Kahn's algorithm — run locally, not left to the AI's judgment. A cycle or a foreign key with no matching table is rejected before any row is generated, and every foreign key value is drawn from that specific parent table's actually-generated primary keys.",
+    text: "Table and foreign-key relationships are parsed from your SQL and topologically sorted with Kahn's algorithm — run locally, not left to the AI's judgment. A foreign key with no matching table, or a cycle of NOT NULL foreign keys, is rejected before any row is generated, and every foreign key value is drawn from that specific parent table's actually-generated primary keys.",
     icon: <HiOutlineShieldCheck className="text-3xl" />
   }
 ];
