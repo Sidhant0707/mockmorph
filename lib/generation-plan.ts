@@ -84,9 +84,23 @@ export function buildGenerationPlan(
           'unsupported_fk_target'
         );
       }
+      // A table may reference its own primary key (a hierarchy such as employees.manager_id).
+      // That is not an ordering problem: generateTableRows only lets such a key point at rows it
+      // has already generated. The primary-key check above has already run, so this is only ever
+      // a self-reference to the primary key. Every other FK still needs its parent ordered first.
+      if (fk.referencesTable === name) continue;
       const parentPos = positionOf.get(fk.referencesTable);
       const childPos = positionOf.get(name);
-      if (parentPos === undefined || childPos === undefined || parentPos >= childPos) {
+      if (parentPos === undefined || childPos === undefined) {
+        throw new PlanValidationError(
+          `${name}.${fk.column} references "${fk.referencesTable}", which is not part of the resolved topology.`,
+          'topology_order_violation'
+        );
+      }
+      if (parentPos >= childPos) {
+        // A nullable FK may point at a table generated later (it breaks a circular dependency):
+        // generateTableRows emits NULL for it. A NOT NULL FK still needs its parent ordered first.
+        if (table.notNull[fk.column] === false) continue;
         throw new PlanValidationError(
           `${name}.${fk.column} references "${fk.referencesTable}", which is not ordered before "${name}" in the resolved topology.`,
           'topology_order_violation'
@@ -282,6 +296,34 @@ function generateColumnValue(
 
 export type PkPools = Map<string, (number | string)[]>;
 
+/** The SQL literal for a primary-key value taken from a pool: uuids are quoted, integers are not. */
+const keyLiteral = (pk: number | string): string | number => (typeof pk === 'string' ? `'${pk}'` : pk);
+
+/** Share of a nullable self-referencing column that is NULL (after the first row), so the data is a forest, not one tree. */
+const SELF_REFERENCE_NULL_SHARE = 0.2;
+
+/**
+ * The value of a column that references its own table's primary key.
+ *
+ * It may only point at a row generated EARLIER in the same table (`earlierPks`). InnoDB checks foreign
+ * keys row by row inside a multi-row INSERT, while Postgres checks at the end of the statement, so
+ * "earlier rows only" is valid on both. Because no row can point forward, the data can never contain
+ * a cycle.
+ *
+ *   - nullable column: the first row is a root (NULL); later rows are NULL about 20% of the time
+ *   - NOT NULL column: the first row points at itself (Postgres accepts that; MySQL's behavior for
+ *     a self-referencing first row has not been verified); later rows point at an earlier row
+ */
+function selfReferenceValue(
+  earlierPks: readonly (number | string)[],
+  ownPk: number | string,
+  nullable: boolean
+): string | number {
+  if (earlierPks.length === 0) return nullable ? 'NULL' : keyLiteral(ownPk);
+  if (nullable && Math.random() < SELF_REFERENCE_NULL_SHARE) return 'NULL';
+  return keyLiteral(earlierPks[Math.floor(Math.random() * earlierPks.length)]);
+}
+
 /**
  * Generates one table's rows, mutating `pkPools` with this table's newly
  * generated primary keys as it goes. A foreign key's value is chosen by
@@ -290,6 +332,12 @@ export type PkPools = Map<string, (number | string)[]>;
  * buildGenerationPlan already guarantees every FK's parent appears earlier
  * in `map.topology`, that parent's pool is always already populated by the
  * time a child table is generated, however many tables separate them.
+ *
+ * Two exceptions:
+ *   - A foreign key that references this same table: its "parent" is the table's own pool, which
+ *     only ever holds the rows generated so far (see selfReferenceValue).
+ *   - A nullable foreign key whose parent is generated later (a cycle broken by a nullable column):
+ *     the parent's pool is still empty, so the value is NULL.
  */
 export function* generateTableRows(
   plan: TablePlan,
@@ -303,32 +351,45 @@ export function* generateTableRows(
   for (let i = 1; i <= rowCount; i++) {
     const row: Record<string, string | number> = {};
 
+    // The row's own key is chosen before any column is filled in, so it does not matter where the key
+    // column is declared (`manager_id` may come before `id`). It joins the pool only once the row is
+    // complete, which is what keeps a self-reference from pointing at the current or a later row.
+    const ownPk: number | string | undefined = table.primaryKey
+      ? table.primaryKey.kind === 'uuid'
+        ? randomUUID()
+        : i
+      : undefined;
+
     for (const colName of table.columns) {
       if (table.primaryKey && colName === table.primaryKey.column) {
-        if (table.primaryKey.kind === 'uuid') {
-          const pk = randomUUID();
-          pool.push(pk);
-          row[colName] = `'${pk}'`;
-        } else {
-          pool.push(i);
-          row[colName] = i;
-        }
+        row[colName] = keyLiteral(ownPk as number | string);
         continue;
       }
 
       const fk = table.foreignKeys.find((f) => f.column === colName);
       if (fk) {
+        if (fk.referencesTable === table.name) {
+          if (ownPk === undefined) {
+            // buildGenerationPlan rejects a self-reference on a table with no primary key.
+            throw new Error(`${table.name}.${colName} references its own table, which has no primary key.`);
+          }
+          row[colName] = selfReferenceValue(pool, ownPk, table.notNull[colName] === false);
+          continue;
+        }
         const parentPool = pkPools.get(fk.referencesTable) ?? [];
         if (parentPool.length === 0) {
-          // buildGenerationPlan's ordering check makes this unreachable in
-          // practice; kept as a hard stop rather than emitting a fabricated
-          // value if that invariant is ever violated.
+          // A nullable FK to a later-generated parent (cycle broken by this column): NULL is the only valid value.
+          if (table.notNull[colName] === false) {
+            row[colName] = 'NULL';
+            continue;
+          }
+          // buildGenerationPlan's ordering check makes this unreachable for a NOT NULL FK; kept as
+          // a hard stop rather than emitting a fabricated value if that invariant is ever violated.
           throw new Error(
             `No generated primary keys available for "${fk.referencesTable}" when generating ${table.name}.${colName}.`
           );
         }
-        const parentPk = parentPool[Math.floor(Math.random() * parentPool.length)];
-        row[colName] = typeof parentPk === 'string' ? `'${parentPk}'` : parentPk;
+        row[colName] = keyLiteral(parentPool[Math.floor(Math.random() * parentPool.length)]);
         continue;
       }
 
@@ -340,6 +401,7 @@ export function* generateTableRows(
       );
     }
 
+    if (ownPk !== undefined) pool.push(ownPk);
     yield row;
   }
 }

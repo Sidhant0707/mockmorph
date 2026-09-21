@@ -98,6 +98,34 @@ describe('resolveGenerationOrder (Kahn\'s algorithm)', () => {
     expect(result.order).toEqual(['employees']);
   });
 
+  it('orders a self-referencing table after its other parents', () => {
+    const tables = [
+      node('employees', [
+        ['manager_id', 'employees'],
+        ['department_id', 'departments'],
+      ]),
+      node('departments'),
+    ];
+    const result = resolveGenerationOrder(tables);
+    expect(result.ok).toBe(true);
+    expect(result.order).toEqual(['departments', 'employees']);
+  });
+
+  it('still rejects a two-table cycle when one of the tables also references itself', () => {
+    const tables = [
+      node('a', [
+        ['parent_id', 'a'],
+        ['b_id', 'b'],
+      ]),
+      node('b', [['a_id', 'a']]),
+      node('c', [['parent_id', 'c']]), // self-reference only: not part of the cycle
+    ];
+    const result = resolveGenerationOrder(tables);
+    expect(result.ok).toBe(false);
+    expect(result.issues[0].type).toBe('circular_dependency');
+    expect(result.issues[0].tables.sort()).toEqual(['a', 'b']);
+  });
+
   it('reports a missing referenced table instead of silently ignoring it', () => {
     const tables = [node('orders', [['user_id', 'nonexistent']])];
     const result = resolveGenerationOrder(tables);

@@ -185,3 +185,34 @@ describe('declared column types (rawType)', () => {
     expect(tables[0].primaryKey).toEqual({ column: 'id', kind: 'integer' });
   });
 });
+
+describe('NOT NULL detection', () => {
+  const notNullByColumn = (sql: string) =>
+    Object.fromEntries(parseSchema(sql).tables[0].columns.map((c) => [c.name, c.notNull]));
+
+  it('records column-level NOT NULL; everything else is nullable', () => {
+    const result = notNullByColumn(`
+      CREATE TABLE t (
+        id SERIAL PRIMARY KEY,
+        a INT NOT NULL,
+        b INT,
+        c INT NULL,
+        d INT REFERENCES t(id) NOT NULL,
+        e INT NOT NULL REFERENCES t(id),
+        f TEXT not
+          null DEFAULT 'x',
+        "g" INT Not Null
+      );`);
+    expect(result).toEqual({ id: true, a: true, b: false, c: false, d: true, e: true, f: true, g: true });
+  });
+
+  it('treats primary-key columns as NOT NULL even when declared without it', () => {
+    expect(notNullByColumn('CREATE TABLE t (id INT PRIMARY KEY, n INT);')).toEqual({ id: true, n: false });
+    // Table-level PRIMARY KEY, with and without a CONSTRAINT name.
+    expect(notNullByColumn('CREATE TABLE t (id INT, n INT, PRIMARY KEY (id));')).toEqual({ id: true, n: false });
+    expect(notNullByColumn('CREATE TABLE t (id INT, n INT, CONSTRAINT pk PRIMARY KEY ("id"));')).toEqual({
+      id: true,
+      n: false,
+    });
+  });
+});

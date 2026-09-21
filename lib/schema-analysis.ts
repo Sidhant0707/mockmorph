@@ -31,6 +31,11 @@ export interface ValidatedTable {
   columnTypes: Record<string, SemanticType>;
   /** What each column can HOLD (from the declared SQL type, parsed locally). Decides the shape of every value. */
   columnInfo: Record<string, ColumnTypeInfo>;
+  /**
+   * Whether each column is NOT NULL (primary-key columns always are). Generation only puts NULL into a column
+   * that is explicitly recorded as `false` here; a column missing from this map is treated as NOT NULL.
+   */
+  notNull: Record<string, boolean>;
   primaryKey: { column: string; kind: Exclude<PrimaryKeyKind, 'unsupported'> } | null;
   foreignKeys: { column: string; referencesTable: string; referencesColumn: string }[];
 }
@@ -53,15 +58,25 @@ export class SchemaAnalysisError extends Error {
   }
 }
 
-function toDependencyNodes(tables: ParsedTable[]): TableNode[] {
-  return tables.map((t) => ({
-    name: t.name,
-    foreignKeys: t.foreignKeys.map((fk) => ({
-      column: fk.column,
-      referencesTable: fk.referencesTable,
-      referencesColumn: fk.referencesColumn,
-    })),
-  }));
+/**
+ * `skipNullable` drops every foreign key whose column is explicitly nullable. It is only used as a
+ * second attempt after the strict sort reports a cycle: a nullable FK can be generated as NULL, so it
+ * does not have to force an insert order. A column whose nullability is unknown keeps its edge.
+ */
+function toDependencyNodes(tables: ParsedTable[], skipNullable = false): TableNode[] {
+  return tables.map((t) => {
+    const notNullByColumn = new Map(t.columns.map((c) => [c.name, c.notNull]));
+    return {
+      name: t.name,
+      foreignKeys: t.foreignKeys
+        .filter((fk) => !skipNullable || notNullByColumn.get(fk.column) !== false)
+        .map((fk) => ({
+          column: fk.column,
+          referencesTable: fk.referencesTable,
+          referencesColumn: fk.referencesColumn,
+        })),
+    };
+  });
 }
 
 interface StructuralResult {
@@ -125,13 +140,44 @@ export function analyzeStructure(rawSql: string): StructuralResult {
     }
   }
 
-  const resolution = resolveGenerationOrder(toDependencyNodes(tables));
-  if (!resolution.ok) {
-    const issue = resolution.issues[0];
-    throw new SchemaAnalysisError(issue.message, issue.type, 422);
+  // Strict sort first: every FK is a hard edge. Only if that reports a cycle, retry once with nullable
+  // FKs ignored. A cycle that still exists after that (all NOT NULL) stays an error.
+  let order: string[];
+  const strict = resolveGenerationOrder(toDependencyNodes(tables));
+  if (strict.ok) {
+    order = strict.order;
+  } else {
+    const issue = strict.issues[0];
+    const relaxed =
+      issue.type === 'circular_dependency' ? resolveGenerationOrder(toDependencyNodes(tables, true)) : null;
+    if (!relaxed || !relaxed.ok) {
+      throw new SchemaAnalysisError(issue.message, issue.type, 422);
+    }
+    order = relaxed.order;
   }
 
-  return { tables, order: resolution.order, warnings };
+  // Nullable FKs whose parent ended up ordered after the child are generated as NULL.
+  const position = new Map(order.map((name, i) => [name, i]));
+  for (const t of tables) {
+    const notNullByColumn = new Map(t.columns.map((c) => [c.name, c.notNull]));
+    for (const fk of t.foreignKeys) {
+      if (fk.referencesTable === t.name) continue;
+      const parentPos = position.get(fk.referencesTable);
+      const childPos = position.get(t.name);
+      if (
+        parentPos !== undefined &&
+        childPos !== undefined &&
+        parentPos >= childPos &&
+        notNullByColumn.get(fk.column) === false
+      ) {
+        warnings.push(
+          `${t.name}.${fk.column} is nullable and references "${fk.referencesTable}", which is generated after "${t.name}" to break a circular dependency, so it is generated as NULL.`
+        );
+      }
+    }
+  }
+
+  return { tables, order, warnings };
 }
 
 /**
@@ -178,9 +224,11 @@ function buildValidatedTables(
     const semanticCols = semanticTypesByTable[t.name] ?? {};
     const columnTypes: Record<string, SemanticType> = {};
     const columnInfo: Record<string, ColumnTypeInfo> = {};
+    const notNull: Record<string, boolean> = {};
     for (const c of t.columns) {
       const info = classifyColumnType(c.rawType);
       columnInfo[c.name] = info;
+      notNull[c.name] = c.notNull;
       // Only value columns matter here: PK/FK values come from the key pools, not from the type.
       if (info.kind === 'unknown' && !c.isPrimaryKey && !c.isForeignKey) {
         warnings.push(
@@ -203,6 +251,7 @@ function buildValidatedTables(
       columns: t.columns.map((c) => c.name),
       columnTypes,
       columnInfo,
+      notNull,
       primaryKey:
         t.primaryKey && t.primaryKey.kind !== 'unsupported'
           ? { column: t.primaryKey.column, kind: t.primaryKey.kind }
