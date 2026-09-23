@@ -673,3 +673,161 @@ describe('generateTableRows: self-referencing foreign key invariants', () => {
     expect(rows.orders.filter((r) => r.user_id === 'NULL')).toHaveLength(0);
   });
 });
+
+describe('buildGenerationPlan: 1:1 tables (a primary key that is also a foreign key)', () => {
+  const users = table('users', { columns: ['id', 'email'], columnTypes: { id: 'pk', email: 'email' } });
+  const usersUuid = table('users', { columns: ['id', 'email'], columnTypes: { id: 'pk', email: 'email' }, primaryKey: { column: 'id', kind: 'uuid' } });
+
+  const profiles = (opts: { primaryKey?: ValidatedTable['primaryKey']; extraFk?: ValidatedTable['foreignKeys'][number] } = {}) =>
+    table('user_profiles', {
+      columns: opts.extraFk ? ['user_id', 'bio', opts.extraFk.column] : ['user_id', 'bio'],
+      columnTypes: opts.extraFk
+        ? { user_id: 'pk', bio: 'fullname', [opts.extraFk.column]: 'fk' }
+        : { user_id: 'pk', bio: 'fullname' },
+      primaryKey: opts.primaryKey ?? { column: 'user_id', kind: 'integer' },
+      foreignKeys: [
+        { column: 'user_id', referencesTable: 'users', referencesColumn: 'id' },
+        ...(opts.extraFk ? [opts.extraFk] : []),
+      ],
+    });
+
+  it('caps a 1:1 table at its parent row count and reports why', () => {
+    // users (non-last) always gets LIMITS.baseParentRows = 15; user_profiles (last) would otherwise
+    // absorb the remainder of the requested 500 rows.
+    const plan = buildGenerationPlan(mapOf([users, profiles()], ['users', 'user_profiles']), 500, LIMITS);
+    expect(plan.tables[0].rowCount).toBe(15);
+    expect(plan.tables[1].rowCount).toBe(15);
+    expect(plan.totalRows).toBe(30);
+    expect(plan.warnings).toHaveLength(1);
+    expect(plan.warnings[0]).toMatch(/user_profiles\.user_id/);
+    expect(plan.warnings[0]).toMatch(/"users"/);
+    expect(plan.warnings[0]).toMatch(/capped at 15 row/);
+    expect(plan.warnings[0]).toMatch(/instead of the requested 485/);
+  });
+
+  it('does not cap or warn when the requested count already fits within the parent', () => {
+    const plan = buildGenerationPlan(mapOf([users, profiles()], ['users', 'user_profiles']), 20, LIMITS);
+    expect(plan.tables[1].rowCount).toBe(5); // 20 - 15, still <= parent's 15
+    expect(plan.warnings).toHaveLength(0);
+  });
+
+  it('does not cap or warn for an ordinary (non-1:1) foreign key, even a NOT NULL one', () => {
+    const orders = table('orders', {
+      columns: ['id', 'user_id'],
+      columnTypes: { id: 'pk', user_id: 'fk' },
+      foreignKeys: [{ column: 'user_id', referencesTable: 'users', referencesColumn: 'id' }],
+      notNull: ['user_id'],
+    });
+    const plan = buildGenerationPlan(mapOf([users, orders], ['users', 'orders']), 5000, LIMITS);
+    expect(plan.tables[1].rowCount).toBe(5000 - 15); // unchanged: an ordinary FK may repeat parent keys
+    expect(plan.warnings).toHaveLength(0);
+  });
+
+  it('every row of a capped 1:1 table gets a distinct key that really exists in the parent', () => {
+    for (let i = 0; i < 50; i++) {
+      const requested = 20 + Math.floor(Math.random() * 2000);
+      const pools: PkPools = new Map();
+      const plan = buildGenerationPlan(mapOf([users, profiles()], ['users', 'user_profiles']), requested, LIMITS);
+      const rows = runAll(pools, plan);
+      const userIds = new Set(pools.get('users'));
+      expect(rows.user_profiles.length).toBeLessThanOrEqual(15);
+      const seen = new Set<string | number>();
+      for (const row of rows.user_profiles) {
+        expect(userIds.has(row.user_id as number)).toBe(true);
+        expect(seen.has(row.user_id)).toBe(false); // distinct: sampled without replacement
+        seen.add(row.user_id);
+      }
+    }
+  });
+
+  it('works with UUID keys, still sampling real parent UUIDs without repeats', () => {
+    const uuidProfiles = profiles({ primaryKey: { column: 'user_id', kind: 'uuid' } });
+    const pools: PkPools = new Map();
+    // parent (users, non-last) always gets baseParentRows=15; requesting baseParentRows+12 gives the
+    // last table (user_profiles) exactly 12 rows, well within the parent's 15 — no cap involved here.
+    const plan = buildGenerationPlan(mapOf([usersUuid, uuidProfiles], ['users', 'user_profiles']), LIMITS.baseParentRows + 12, LIMITS);
+    const rows = runAll(pools, plan);
+    const userIds = new Set(pools.get('users'));
+    expect(rows.user_profiles).toHaveLength(12);
+    const seen = new Set<string | number>();
+    for (const row of rows.user_profiles) {
+      const rawId = (row.user_id as string).slice(1, -1); // strip the SQL string quotes
+      expect(userIds.has(rawId)).toBe(true);
+      expect(seen.has(rawId)).toBe(false);
+      seen.add(rawId);
+    }
+  });
+
+  it('a chain (a <- b <- c) keeps each pool a subset of its parent\'s, and caps the last one that needs it', () => {
+    const a = table('a', { columns: ['id'], columnTypes: { id: 'pk' } });
+    const b = table('b', {
+      columns: ['id'],
+      columnTypes: { id: 'pk' },
+      foreignKeys: [{ column: 'id', referencesTable: 'a', referencesColumn: 'id' }],
+    });
+    const c = table('c', {
+      columns: ['id'],
+      columnTypes: { id: 'pk' },
+      foreignKeys: [{ column: 'id', referencesTable: 'b', referencesColumn: 'id' }],
+    });
+    const pools: PkPools = new Map();
+    const plan = buildGenerationPlan(mapOf([a, b, c], ['a', 'b', 'c']), 1000, LIMITS);
+    const rows = runAll(pools, plan);
+    expect(plan.tables.map((t) => t.rowCount)).toEqual([15, 15, 15]); // a and b are non-last (=15); c is last, capped to b's 15
+    const aIds = pools.get('a')!;
+    const bIds = pools.get('b')!;
+    const cIds = pools.get('c')!;
+    expect(bIds.every((id) => aIds.includes(id))).toBe(true);
+    expect(cIds.every((id) => bIds.includes(id))).toBe(true);
+    expect(new Set(rows.b.map((r) => r.id)).size).toBe(rows.b.length);
+    expect(new Set(rows.c.map((r) => r.id)).size).toBe(rows.c.length);
+  });
+
+  it('picks the first k parent keys in the parent\'s own generation order (documented, simplest choice)', () => {
+    const pools: PkPools = new Map();
+    const plan = buildGenerationPlan(mapOf([users, profiles()], ['users', 'user_profiles']), LIMITS.baseParentRows + 10, LIMITS);
+    const rows = runAll(pools, plan);
+    // users are sequential integer keys 1..15; requesting 10 rows of user_profiles should take 1..10.
+    expect(rows.user_profiles.map((r) => r.user_id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+  });
+
+  it('a 1:1 table can also have an ordinary FK to a different parent; both are correct at once', () => {
+    const companies = table('companies', { columns: ['id'], columnTypes: { id: 'pk' } });
+    const withCompany = profiles({ extraFk: { column: 'company_id', referencesTable: 'companies', referencesColumn: 'id' } });
+    const pools: PkPools = new Map();
+    const plan = buildGenerationPlan(mapOf([users, companies, withCompany], ['users', 'companies', 'user_profiles']), 12, LIMITS);
+    const rows = runAll(pools, plan);
+    const userIds = new Set(pools.get('users'));
+    const companyIds = new Set(pools.get('companies'));
+    expect(rows.user_profiles.length).toBeGreaterThan(0);
+    for (const row of rows.user_profiles) {
+      expect(userIds.has(row.user_id as number)).toBe(true);
+      expect(companyIds.has(row.company_id as number)).toBe(true);
+    }
+  });
+
+  it('composite primary keys stay rejected as unsupported, unaffected by this feature', () => {
+    // schema-analysis (not generation-plan) rejects composite PKs before a ValidatedTable can even
+    // exist; buildGenerationPlan never sees one. This is a smoke check that nothing here assumes a
+    // single-column primaryKey.column can be absent — pkForeignKey simply returns undefined.
+    const noPk = { ...profiles(), primaryKey: null };
+    const plan = buildGenerationPlan(mapOf([users, noPk], ['users', 'user_profiles']), 50, LIMITS);
+    expect(plan.warnings).toHaveLength(0);
+    expect(plan.tables[1].rowCount).toBe(50 - 15);
+  });
+
+  it('generateTableRows refuses to fabricate a key if a parent pool is missing (defensive hard stop)', () => {
+    // Bypasses buildGenerationPlan's own cap/ordering guarantees to exercise the guard directly.
+    const plan = { table: profiles(), rowCount: 5 };
+    expect(() => Array.from(generateTableRows(plan, 'postgres', new Map()))).toThrow(/no generated primary keys yet/);
+  });
+
+  it('is the same for the mysql dialect', () => {
+    const pools: PkPools = new Map();
+    const plan = buildGenerationPlan(mapOf([users, profiles()], ['users', 'user_profiles']), 500, LIMITS);
+    const rows = runAll(pools, plan, 'mysql');
+    const userIds = new Set(pools.get('users'));
+    expect(rows.user_profiles).toHaveLength(15);
+    for (const row of rows.user_profiles) expect(userIds.has(row.user_id as number)).toBe(true);
+  });
+});

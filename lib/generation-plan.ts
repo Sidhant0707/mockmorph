@@ -11,6 +11,13 @@
  * primary-key pool in a Map keyed by table name, and every foreign key
  * looks up its own referenced table's pool by name — never "whichever
  * table happened to be generated immediately before this one."
+ *
+ * A 1:1 table — one whose primary key is also a foreign key, e.g.
+ * `user_id INT PRIMARY KEY REFERENCES users(id)` — is a special case of
+ * that same lookup: see pkForeignKey below. Its row count is capped to its
+ * parent's actual row count here, and generateTableRows draws its keys
+ * from the parent's pool instead of minting fresh ones, so it can never
+ * plan or generate more rows than the parent has primary keys.
  */
 
 import { randomUUID } from 'crypto';
@@ -29,6 +36,21 @@ export interface GenerationPlan {
   /** In topological order — parents before children. */
   tables: TablePlan[];
   totalRows: number;
+  /** Non-fatal notices about the plan itself (e.g. a row-count cap). Emitted as SQL comments by the caller. */
+  warnings: string[];
+}
+
+/**
+ * A table's primary key can also be a foreign key (a 1:1 table, e.g.
+ * `user_id INT PRIMARY KEY REFERENCES users(id)`). Returns that foreign key,
+ * or undefined for an ordinary primary key. A self-reference (a PK column
+ * that points at its own table) is deliberately excluded here — that is a
+ * different, already-handled case (see generateTableRows' self-reference
+ * branch) and must keep generating its own fresh keys.
+ */
+function pkForeignKey(table: ValidatedTable): ValidatedTable['foreignKeys'][number] | undefined {
+  if (!table.primaryKey) return undefined;
+  return table.foreignKeys.find((fk) => fk.column === table.primaryKey!.column && fk.referencesTable !== table.name);
 }
 
 export class PlanValidationError extends Error {
@@ -114,12 +136,35 @@ export function buildGenerationPlan(
   const lastIndex = rowCounts.length - 1;
   rowCounts[lastIndex] = Math.max(limits.minRows, requestedRows - allocated);
 
+  // A 1:1 table (its primary key is also a foreign key to another table) can never have more rows
+  // than its parent: every row's key must be a distinct key that actually exists in the parent. The
+  // ordering check above already guarantees the parent is processed first (its PK column is always
+  // NOT NULL, so a 1:1 FK can never use the nullable-cycle exception), so by the time a table is
+  // reached here its parent's rowCounts entry is already final — chains (a <- b <- c) cap correctly
+  // because each step caps against its own parent's already-capped count.
+  const warnings: string[] = [];
+  for (let i = 0; i < map.topology.length; i++) {
+    const name = map.topology[i];
+    const table = map.tables[name];
+    const fk = pkForeignKey(table);
+    if (!fk) continue;
+    const parentPos = positionOf.get(fk.referencesTable);
+    if (parentPos === undefined) continue; // already reported as missing_parent_table above
+    const parentRows = rowCounts[parentPos];
+    if (parentRows < rowCounts[i]) {
+      warnings.push(
+        `${name}.${fk.column} is a foreign key to "${fk.referencesTable}".${fk.referencesColumn} that is also ${name}'s primary key, so ${name} is capped at ${parentRows} row(s) (matching "${fk.referencesTable}"'s row count) instead of the requested ${rowCounts[i]}.`
+      );
+      rowCounts[i] = parentRows;
+    }
+  }
+
   const tables: TablePlan[] = map.topology.map((name, i) => ({
     table: map.tables[name],
     rowCount: rowCounts[i],
   }));
 
-  return { tables, totalRows: tables.reduce((sum, t) => sum + t.rowCount, 0) };
+  return { tables, totalRows: tables.reduce((sum, t) => sum + t.rowCount, 0), warnings };
 }
 
 // ---------------------------------------------------------------------------
@@ -348,17 +393,47 @@ export function* generateTableRows(
   const pool: (number | string)[] = [];
   pkPools.set(table.name, pool);
 
+  // A 1:1 table's own primary key IS a foreign key to another table (see pkForeignKey in
+  // buildGenerationPlan, which also guarantees rowCount <= the parent's actual pool size). Its rows
+  // take the parent's first `rowCount` keys, in the parent's own generation order — the simplest
+  // subset to pick: no extra sampling or shuffling step, and it keeps a chain (a <- b <- c) trivially
+  // consistent, since each table's pool is then a prefix of its parent's.
+  const oneToOnePkFk = pkForeignKey(table);
+  let oneToOneParentPool: readonly (number | string)[] | undefined;
+  if (oneToOnePkFk) {
+    oneToOneParentPool = pkPools.get(oneToOnePkFk.referencesTable);
+    if (!oneToOneParentPool) {
+      // buildGenerationPlan's ordering check makes this unreachable for a PK-is-FK column (it is
+      // always NOT NULL, so it never gets the nullable-cycle exception); kept as a hard stop rather
+      // than silently generating a fresh, unrelated key instead of one that exists in the parent.
+      throw new Error(
+        `${table.name}.${table.primaryKey!.column} references "${oneToOnePkFk.referencesTable}", which has no generated primary keys yet.`
+      );
+    }
+  }
+
   for (let i = 1; i <= rowCount; i++) {
     const row: Record<string, string | number> = {};
 
     // The row's own key is chosen before any column is filled in, so it does not matter where the key
     // column is declared (`manager_id` may come before `id`). It joins the pool only once the row is
     // complete, which is what keeps a self-reference from pointing at the current or a later row.
-    const ownPk: number | string | undefined = table.primaryKey
+    let ownPk: number | string | undefined = table.primaryKey
       ? table.primaryKey.kind === 'uuid'
         ? randomUUID()
         : i
       : undefined;
+
+    if (oneToOneParentPool) {
+      if (oneToOneParentPool.length < i) {
+        // buildGenerationPlan's cap makes this unreachable; kept as a hard stop rather than
+        // fabricating a key that does not exist in the parent.
+        throw new Error(
+          `${table.name}.${table.primaryKey!.column} needs row ${i} of "${table.name}", but its parent only has ${oneToOneParentPool.length} generated primary key(s).`
+        );
+      }
+      ownPk = oneToOneParentPool[i - 1];
+    }
 
     for (const colName of table.columns) {
       if (table.primaryKey && colName === table.primaryKey.column) {

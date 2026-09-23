@@ -124,6 +124,9 @@ function createGenerationStream(options: GenerationOptions): ReadableStream<Uint
           minRows: LIMITS.MIN_ROWS,
         });
         await send(`-- [LOCAL] Generation plan validated for ${dialect.toUpperCase()}.`, 100);
+        for (const warning of plan.warnings) {
+          await send(`-- [WARN] ${warning}`, 20);
+        }
         await send('', 50);
 
         let totalGenerated = 0;

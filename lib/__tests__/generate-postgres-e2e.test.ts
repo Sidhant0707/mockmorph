@@ -453,3 +453,152 @@ describe('self-referencing foreign keys', () => {
     expect(text).not.toContain('INSERT INTO');
   });
 });
+
+describe('1:1 tables (a primary key that is also a foreign key)', () => {
+  /** Every user_id-style FK value in `child` must be a distinct value that really exists in `parent`. */
+  async function assertOneToOne(child: string, fk: string, parent: string, pk = 'id'): Promise<void> {
+    const orphans = await db.query(
+      `SELECT 1 FROM "${child}" c LEFT JOIN "${parent}" p ON p."${pk}" = c."${fk}" WHERE p."${pk}" IS NULL`
+    );
+    expect(orphans.rows).toHaveLength(0);
+    const dup = await db.query<{ total: number; distinct: number }>(
+      `SELECT count(*)::int AS total, count(DISTINCT "${fk}")::int AS distinct FROM "${child}"`
+    );
+    expect(dup.rows[0].distinct).toBe(dup.rows[0].total);
+  }
+
+  it('the exact reported repro: 50 rows no longer violates the foreign key, and the table is capped', async () => {
+    const schema = `
+      CREATE TABLE users (id SERIAL PRIMARY KEY, email VARCHAR(100));
+      CREATE TABLE user_profiles (user_id INT PRIMARY KEY REFERENCES users(id), bio TEXT);`;
+    const sql = await generateSql(schema, { rows: 50 });
+    expect(sql).toContain('[WARN]');
+    expect(sql).toMatch(/user_profiles\.user_id/);
+    expect(sql).toMatch(/capped at 15 row/);
+    await loadIntoPostgres(schema, sql);
+    expect(await count('users')).toBe(15);
+    expect(await count('user_profiles')).toBe(15); // capped to match users, not the requested 35
+    await assertOneToOne('user_profiles', 'user_id', 'users');
+  });
+
+  it('10 rows (fewer than the parent has): no cap, no warning, still valid', async () => {
+    const schema = `
+      CREATE TABLE users (id SERIAL PRIMARY KEY, email VARCHAR(100));
+      CREATE TABLE user_profiles (user_id INT PRIMARY KEY REFERENCES users(id), bio TEXT);`;
+    const sql = await generateSql(schema, { rows: 10 });
+    expect(sql).not.toContain('[WARN]');
+    await loadIntoPostgres(schema, sql);
+    expect(await count('users')).toBe(15);
+    // users (non-last) always gets baseParentRows=15; user_profiles (last, requested 10) gets
+    // max(minRows=1, 10 - 15) = 1 — still well within the parent, so nothing is capped.
+    expect(await count('user_profiles')).toBe(1);
+    await assertOneToOne('user_profiles', 'user_id', 'users');
+  });
+
+  it('a chain a <- b <- c: every level stays a valid, distinct subset of its parent', async () => {
+    const schema = `
+      CREATE TABLE a (id SERIAL PRIMARY KEY);
+      CREATE TABLE b (id INT PRIMARY KEY REFERENCES a(id));
+      CREATE TABLE c (id INT PRIMARY KEY REFERENCES b(id));`;
+    const sql = await generateSql(schema, { rows: 500 });
+    await loadIntoPostgres(schema, sql);
+    await assertOneToOne('b', 'id', 'a');
+    await assertOneToOne('c', 'id', 'b');
+    expect(await count('c')).toBeLessThanOrEqual(await count('b'));
+    expect(await count('b')).toBeLessThanOrEqual(await count('a'));
+  });
+
+  it('the table-level PRIMARY KEY / FOREIGN KEY form', async () => {
+    const schema = `
+      CREATE TABLE users (id SERIAL PRIMARY KEY, email VARCHAR(100));
+      CREATE TABLE user_profiles (
+        user_id INT,
+        bio TEXT,
+        PRIMARY KEY (user_id),
+        FOREIGN KEY (user_id) REFERENCES users(id)
+      );`;
+    const sql = await generateSql(schema, { rows: 80 });
+    await loadIntoPostgres(schema, sql);
+    await assertOneToOne('user_profiles', 'user_id', 'users');
+  });
+
+  it('uuid keys', async () => {
+    const schema = `
+      CREATE TABLE users (id UUID PRIMARY KEY, email VARCHAR(100));
+      CREATE TABLE user_profiles (user_id UUID PRIMARY KEY REFERENCES users(id), bio TEXT);`;
+    const sql = await generateSql(schema, { rows: 80 });
+    await loadIntoPostgres(schema, sql);
+    await assertOneToOne('user_profiles', 'user_id', 'users');
+  });
+
+  it('quoted identifiers', async () => {
+    const schema = `
+      CREATE TABLE "Users" ("Id" SERIAL PRIMARY KEY, "Email" VARCHAR(100));
+      CREATE TABLE "UserProfiles" ("UserId" INT PRIMARY KEY REFERENCES "Users"("Id"), "Bio" TEXT);`;
+    const sql = await generateSql(schema, { rows: 80 });
+    await loadIntoPostgres(schema, sql);
+    await assertOneToOne('UserProfiles', 'UserId', 'Users', 'Id');
+  });
+
+  it('a 1:1 table that also has an ordinary foreign key to a different parent', async () => {
+    const schema = `
+      CREATE TABLE companies (id SERIAL PRIMARY KEY, name TEXT);
+      CREATE TABLE users (id SERIAL PRIMARY KEY, email VARCHAR(100));
+      CREATE TABLE user_profiles (
+        user_id INT PRIMARY KEY REFERENCES users(id),
+        company_id INT NOT NULL REFERENCES companies(id),
+        bio TEXT
+      );`;
+    const sql = await generateSql(schema, { rows: 200 });
+    await loadIntoPostgres(schema, sql);
+    await assertOneToOne('user_profiles', 'user_id', 'users');
+    const orphanCompanies = await db.query(
+      'SELECT 1 FROM user_profiles p LEFT JOIN companies c ON c.id = p.company_id WHERE c.id IS NULL'
+    );
+    expect(orphanCompanies.rows).toHaveLength(0);
+  });
+
+  it('non-PK-non-FK behavior, ordinary FKs, and self-referencing FKs are unaffected next to a 1:1 table', async () => {
+    const schema = `
+      CREATE TABLE departments (id SERIAL PRIMARY KEY, name TEXT);
+      CREATE TABLE employees (
+        id SERIAL PRIMARY KEY,
+        department_id INT NOT NULL REFERENCES departments(id),
+        manager_id INT REFERENCES employees(id)
+      );
+      CREATE TABLE employee_reviews (employee_id INT PRIMARY KEY REFERENCES employees(id), rating INT);`;
+    const sql = await generateSql(schema, { rows: 400 });
+    await loadIntoPostgres(schema, sql);
+    const orphanDept = await db.query(
+      'SELECT 1 FROM employees e LEFT JOIN departments d ON d.id = e.department_id WHERE d.id IS NULL'
+    );
+    expect(orphanDept.rows).toHaveLength(0);
+    const backwards = await db.query('SELECT 1 FROM employees WHERE manager_id >= id');
+    expect(backwards.rows).toHaveLength(0);
+    await assertOneToOne('employee_reviews', 'employee_id', 'employees');
+  });
+
+  it('stress: several thousand rows, many randomized runs, always a valid distinct subset', async () => {
+    const schema = `
+      CREATE TABLE users (id SERIAL PRIMARY KEY, email VARCHAR(100));
+      CREATE TABLE user_profiles (user_id INT PRIMARY KEY REFERENCES users(id), bio TEXT);`;
+    for (let i = 0; i < 15; i++) {
+      await db.exec('DROP SCHEMA public CASCADE; CREATE SCHEMA public;');
+      const rows = 100 + Math.floor(Math.random() * 5000);
+      const sql = await generateSql(schema, { rows });
+      await loadIntoPostgres(schema, sql);
+      expect(await count('user_profiles')).toBeLessThanOrEqual(await count('users'));
+      await assertOneToOne('user_profiles', 'user_id', 'users');
+    }
+
+    await db.exec('DROP SCHEMA public CASCADE; CREATE SCHEMA public;');
+    const bigSchema = `
+      CREATE TABLE a (id UUID PRIMARY KEY);
+      CREATE TABLE b (id UUID PRIMARY KEY REFERENCES a(id));
+      CREATE TABLE c (id UUID PRIMARY KEY REFERENCES b(id));`;
+    const bigSql = await generateSql(bigSchema, { rows: 9000 });
+    await loadIntoPostgres(bigSchema, bigSql);
+    await assertOneToOne('b', 'id', 'a');
+    await assertOneToOne('c', 'id', 'b');
+  });
+});

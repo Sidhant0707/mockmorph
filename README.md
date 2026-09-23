@@ -9,6 +9,7 @@ Table structure (order, primary keys, foreign keys) is worked out **locally** by
 - **Local dependency resolution.** Foreign-key relationships are parsed from your SQL and ordered with Kahn's algorithm, so parent tables are always inserted before their children. Foreign keys pointing at missing tables, and cycles between tables in which every foreign key is `NOT NULL`, are rejected before any row is generated. A cycle that a nullable foreign key can break is accepted: that column is generated as `NULL` (its parent is created later) and the analysis reports a warning.
 - **Correct foreign keys.** Every table keeps a pool of the primary keys it generated. A foreign key picks its value from the pool of the table its `REFERENCES` clause names, however many tables sit in between.
 - **Self-referencing foreign keys.** A table can reference its own primary key (for example `employees.manager_id REFERENCES employees(id)`), with integer or UUID keys, inline or table-level, and any number of such columns per table. A row may only point at a row generated earlier in the same table, so the data is always a valid hierarchy with no cycles. A nullable column gets `NULL` for the first row (a root) and for about a fifth of the rest; a `NOT NULL` column makes the first row reference itself, which PostgreSQL accepts but has not been verified on MySQL.
+- **1:1 tables (a primary key that is also a foreign key).** A table like `user_profiles(user_id INT PRIMARY KEY REFERENCES users(id))` gets its keys sampled from the parent's own generated primary keys, so every row is a real parent row and no two rows share one. Chains of these (`a <- b <- c`) work the same way. If the requested row count would exceed the parent's, the table is capped at the parent's row count instead, with a warning explaining why.
 - **Integer and UUID primary keys.** Integer keys are sequential; UUID keys are real random UUIDs.
 - **Streaming output.** Results stream to the terminal-style UI as they are generated. Copy them or download as `.sql`.
 - **AI semantic labels, with overrides.** Analyze a schema once, adjust any column's type in the UI, and reuse that classification without spending another AI call.
@@ -161,7 +162,6 @@ Not supported yet:
 
 These are open issues rather than design choices:
 
-- **A primary key that is also a foreign key** (one-to-one extension tables) can generate foreign-key violations.
 - **Plain integer columns** (such as `quantity` or `stock`) are filled with string placeholders, because the semantic type list has no integer type. Those `INSERT`s will fail on a typed integer column.
 - **Generated values are templated.** Emails, names and companies come from fixed patterns, not a realistic data library. Values do not consider `CHECK` constraints or enum types.
 - The generate UI shows the HTTP status code, not the server's error message, when a request is rejected.
