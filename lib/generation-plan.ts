@@ -53,6 +53,33 @@ function pkForeignKey(table: ValidatedTable): ValidatedTable['foreignKeys'][numb
   return table.foreignKeys.find((fk) => fk.column === table.primaryKey!.column && fk.referencesTable !== table.name);
 }
 
+/**
+ * UNIQUE foreign keys other than the table's own primary key — the common `user_id INT UNIQUE
+ * REFERENCES users(id)` pattern. Like pkForeignKey, a self-reference is excluded: a self-FK
+ * marked UNIQUE keeps its existing (unenforced) behavior — see the warning schema-analysis.ts
+ * emits for that case — rather than a second sampling mechanism on top of selfReferenceValue.
+ */
+function uniqueForeignKeys(table: ValidatedTable): ValidatedTable['foreignKeys'] {
+  return table.foreignKeys.filter(
+    (fk) =>
+      table.uniqueColumns.includes(fk.column) &&
+      fk.referencesTable !== table.name &&
+      !(table.primaryKey && fk.column === table.primaryKey.column)
+  );
+}
+
+/**
+ * UNIQUE columns that hold an ordinary generated value rather than a key: not the primary key,
+ * and not any foreign key (an ordinary UNIQUE foreign key is handled by uniqueForeignKeys above;
+ * a self-referencing one keeps its old, unenforced behavior — see uniqueForeignKeys).
+ */
+function valueOnlyUniqueColumns(table: ValidatedTable): string[] {
+  return table.uniqueColumns.filter(
+    (col) =>
+      !(table.primaryKey && col === table.primaryKey.column) && !table.foreignKeys.some((fk) => fk.column === col)
+  );
+}
+
 export class PlanValidationError extends Error {
   readonly kind: string;
   constructor(message: string, kind: string) {
@@ -136,26 +163,73 @@ export function buildGenerationPlan(
   const lastIndex = rowCounts.length - 1;
   rowCounts[lastIndex] = Math.max(limits.minRows, requestedRows - allocated);
 
-  // A 1:1 table (its primary key is also a foreign key to another table) can never have more rows
-  // than its parent: every row's key must be a distinct key that actually exists in the parent. The
-  // ordering check above already guarantees the parent is processed first (its PK column is always
-  // NOT NULL, so a 1:1 FK can never use the nullable-cycle exception), so by the time a table is
-  // reached here its parent's rowCounts entry is already final — chains (a <- b <- c) cap correctly
-  // because each step caps against its own parent's already-capped count.
+  // A table's row count can be capped for three reasons, all handled here in one pass, in
+  // topology order (parents before children), so a chain (a <- b <- c) caps correctly at every
+  // level — by the time a table is reached here, everything it could depend on (a parent's row
+  // count) is already final:
+  //   1. A 1:1 table (its primary key is also a foreign key to another table) can never have
+  //      more rows than its parent: every row's key must be a distinct key that really exists
+  //      in the parent.
+  //   2. A UNIQUE foreign key that is not the primary key (e.g. `user_id INT UNIQUE REFERENCES
+  //      users(id)`) is the same idea, generalized: it also samples the parent's keys without
+  //      replacement, so it is capped the same way.
+  //   3. A UNIQUE value-only column (no foreign key involved) is capped when its declared SQL
+  //      type has too small a value space for the requested row count (e.g. BOOLEAN UNIQUE,
+  //      a narrow VARCHAR(n) UNIQUE) — capping, rather than rejecting the whole request, is the
+  //      same choice already made for (1) and (2), applied consistently here too.
   const warnings: string[] = [];
   for (let i = 0; i < map.topology.length; i++) {
     const name = map.topology[i];
     const table = map.tables[name];
-    const fk = pkForeignKey(table);
-    if (!fk) continue;
-    const parentPos = positionOf.get(fk.referencesTable);
-    if (parentPos === undefined) continue; // already reported as missing_parent_table above
-    const parentRows = rowCounts[parentPos];
-    if (parentRows < rowCounts[i]) {
-      warnings.push(
-        `${name}.${fk.column} is a foreign key to "${fk.referencesTable}".${fk.referencesColumn} that is also ${name}'s primary key, so ${name} is capped at ${parentRows} row(s) (matching "${fk.referencesTable}"'s row count) instead of the requested ${rowCounts[i]}.`
-      );
-      rowCounts[i] = parentRows;
+    const reasons: { cap: number; message: string }[] = [];
+
+    const pkFk = pkForeignKey(table);
+    if (pkFk) {
+      const parentPos = positionOf.get(pkFk.referencesTable);
+      if (parentPos !== undefined) {
+        // already reported as missing_parent_table above if undefined
+        const parentRows = rowCounts[parentPos];
+        reasons.push({
+          cap: parentRows,
+          message: `${name}.${pkFk.column} is a foreign key to "${pkFk.referencesTable}".${pkFk.referencesColumn} that is also ${name}'s primary key, so ${name} is capped at ${parentRows} row(s) (matching "${pkFk.referencesTable}"'s row count) instead of the requested ${rowCounts[i]}.`,
+        });
+      }
+    }
+
+    for (const uniqueFk of uniqueForeignKeys(table)) {
+      const parentPos = positionOf.get(uniqueFk.referencesTable);
+      if (parentPos === undefined) continue; // already reported as missing_parent_table above
+      // A nullable FK whose parent is ordered after this table breaks a cycle and is always
+      // generated as NULL (see analyzeStructure / generateTableRows); a NOT NULL FK can only
+      // reach this point with its parent already ordered earlier (guaranteed by the ordering
+      // check above), so this can only be that cycle-break case. NULLs never collide, so no cap.
+      if (parentPos >= i) continue;
+      const parentRows = rowCounts[parentPos];
+      reasons.push({
+        cap: parentRows,
+        message: `${name}.${uniqueFk.column} is a UNIQUE foreign key to "${uniqueFk.referencesTable}".${uniqueFk.referencesColumn}, so ${name} is capped at ${parentRows} row(s) (matching "${uniqueFk.referencesTable}"'s row count) instead of the requested ${rowCounts[i]}.`,
+      });
+    }
+
+    for (const colName of valueOnlyUniqueColumns(table)) {
+      const info = table.columnInfo[colName] ?? UNKNOWN_COLUMN;
+      // Dialect does not affect capacity (only how a value is formatted), so a fixed dialect is
+      // fine here; generateTableRows recomputes the domain with the real dialect for the values.
+      const domain = uniqueDomainForColumn(info, colName, 'postgres');
+      if (!domain || domain.capacity >= rowCounts[i]) continue;
+      reasons.push({
+        cap: domain.capacity,
+        message: `${name}.${colName} is UNIQUE, but its declared type only has room for ${domain.capacity} distinct value(s), so ${name} is capped at ${domain.capacity} row(s) instead of the requested ${rowCounts[i]}.`,
+      });
+    }
+
+    if (reasons.length === 0) continue;
+    const newCount = Math.min(rowCounts[i], ...reasons.map((r) => r.cap));
+    if (newCount < rowCounts[i]) {
+      for (const r of reasons) {
+        if (r.cap === newCount) warnings.push(r.message);
+      }
+      rowCounts[i] = newCount;
     }
   }
 
@@ -339,6 +413,213 @@ function generateColumnValue(
   }
 }
 
+// ---------------------------------------------------------------------------
+// UNIQUE value generation
+//
+// generateColumnValue above picks each value independently, so nothing stops
+// two rows from colliding — fine for an ordinary column, not for one declared
+// UNIQUE. A UNIQUE column instead draws from a small, explicit "domain": the
+// finite set of distinct values this generator is willing to produce for that
+// SQL type. uniqueDomainForColumn reports that domain's size (its `capacity`)
+// so buildGenerationPlan can cap a table's row count up front — the same
+// choice it already makes for a 1:1 table's PK-that-is-FK — and reports a
+// function from a distinct index to the row's actual SQL literal.
+//
+// UNIQUE text columns are a deliberate special case: generating within the
+// declared VARCHAR(n)/CHAR(n) length from the start (rather than generating a
+// normal semantic-flavored value and truncating it afterward) is the only way
+// to guarantee two rows can't collide once Postgres itself truncates/compares
+// them — the exact bug in the report (a `phone`/`email`-flavored value that
+// only "happened" to stay distinct). The trade-off is that a UNIQUE text
+// column loses its semantic flavor (no more obsidian.corp emails); applying
+// that uniformly, regardless of length, was chosen over a second code path
+// that only kicks in for narrow columns.
+// ---------------------------------------------------------------------------
+
+interface UniqueDomain {
+  /** How many distinct values this generator can produce for this column. */
+  capacity: number;
+  /** Maps a distinct index in [0, capacity) to the row's SQL literal (quoted where needed). */
+  valueAt: (index: number) => string | number;
+}
+
+/** Fixed alphabet for UNIQUE text values: digits + lowercase letters (base 36). */
+const UNIQUE_TEXT_ALPHABET_SIZE = 36;
+/**
+ * Generation length used for a UNIQUE text column with no declared length, or one longer than
+ * this. 36**10 (~3.66e15) is comfortably within a safe integer and gives a domain no realistic
+ * row count will ever reach, while keeping the generated token short.
+ */
+const UNIQUE_TEXT_DEFAULT_LEN = 10;
+
+function uniqueTextDomain(maxLength: number | undefined): UniqueDomain {
+  const length = maxLength === undefined ? UNIQUE_TEXT_DEFAULT_LEN : Math.min(Math.max(maxLength, 0), UNIQUE_TEXT_DEFAULT_LEN);
+  if (length === 0) return { capacity: 1, valueAt: () => `''` };
+  const capacity = UNIQUE_TEXT_ALPHABET_SIZE ** length;
+  return { capacity, valueAt: (index) => `'${index.toString(36).padStart(length, '0')}'` };
+}
+
+function uniqueIntegerDomain(info: ColumnTypeInfo, columnName: string): UniqueDomain {
+  const maxInt = info.maxInt ?? 1000;
+  const [min, max] = namedIntegerRange(columnName, maxInt) ?? [1, maxInt];
+  return { capacity: max - min + 1, valueAt: (index) => min + index };
+}
+
+/** Same (precision, scale) reasoning as decimalValue, but as an enumerable, capacity-bounded space. */
+function uniqueDecimalDomain(info: ColumnTypeInfo): UniqueDomain {
+  const scale = info.scale ?? 2;
+  const intDigits = info.precision === undefined ? 4 : info.precision - scale;
+  if (intDigits < 0) {
+    const onlyValue = scale === 0 ? '0' : `0.${'0'.repeat(scale)}`;
+    return { capacity: 1, valueAt: () => onlyValue };
+  }
+  const intRange = intDigits === 0 ? 1 : Math.min(5001, 10 ** Math.min(intDigits, 4));
+  const fracRange = scale === 0 ? 1 : 10 ** scale;
+  return {
+    capacity: intRange * fracRange,
+    valueAt: (index) => {
+      const intPart = Math.floor(index / fracRange);
+      return scale === 0 ? String(intPart) : `${intPart}.${String(index % fracRange).padStart(scale, '0')}`;
+    },
+  };
+}
+
+/** Same 0.00-999.99 range as generateColumnValue's plain float generator, enumerated in cent steps. */
+function uniqueFloatDomain(): UniqueDomain {
+  return { capacity: 100_000, valueAt: (index) => (index / 100).toFixed(2) };
+}
+
+function uniqueBooleanDomain(dialect: Dialect): UniqueDomain {
+  return {
+    capacity: 2,
+    valueAt: (index) => {
+      if (dialect === 'mysql') return index === 0 ? 1 : 0;
+      return index === 0 ? 'TRUE' : 'FALSE';
+    },
+  };
+}
+
+/**
+ * A UNIQUE DATE column deliberately gets a much wider range than generateColumnValue's plain
+ * dates (a fixed 28-day month): 20,000 days (~54 years) so realistic row counts are never capped,
+ * while staying a real, finite domain rather than pretending it is unlimited.
+ */
+const UNIQUE_DATE_CAPACITY = 20_000;
+const UNIQUE_DATE_BASE_MS = Date.UTC(2000, 0, 1);
+function uniqueDateDomain(): UniqueDomain {
+  return {
+    capacity: UNIQUE_DATE_CAPACITY,
+    valueAt: (index) => `'${new Date(UNIQUE_DATE_BASE_MS + index * 86_400_000).toISOString().slice(0, 10)}'`,
+  };
+}
+
+/** One-second increments from a fixed epoch: ~1.5 years of distinct timestamps. */
+const UNIQUE_TIMESTAMP_CAPACITY = 50_000_000;
+const UNIQUE_TIMESTAMP_BASE_MS = Date.UTC(2000, 0, 1, 0, 0, 0);
+function uniqueTimestampDomain(): UniqueDomain {
+  return {
+    capacity: UNIQUE_TIMESTAMP_CAPACITY,
+    valueAt: (index) => {
+      const iso = new Date(UNIQUE_TIMESTAMP_BASE_MS + index * 1000).toISOString();
+      return `'${iso.slice(0, 10)} ${iso.slice(11, 19)}'`;
+    },
+  };
+}
+
+/** One-second increments across a single day. */
+function uniqueTimeDomain(): UniqueDomain {
+  return {
+    capacity: 86_400,
+    valueAt: (index) => `'${pad2(Math.floor(index / 3600))}:${pad2(Math.floor((index % 3600) / 60))}:${pad2(index % 60)}'`,
+  };
+}
+
+/**
+ * The UNIQUE domain for a column's declared kind, or null if this module cannot guarantee
+ * distinct values for that kind (json, array, unknown — schema-analysis already warns about
+ * these; the column keeps generateColumnValue's ordinary, unenforced behavior) or if the kind
+ * has no meaningful capacity to cap on (uuid — see generateDistinctUuids instead, which sidesteps
+ * this abstraction entirely since a UUID's "domain" isn't something worth enumerating).
+ */
+function uniqueDomainForColumn(info: ColumnTypeInfo, columnName: string, dialect: Dialect): UniqueDomain | null {
+  switch (info.kind) {
+    case 'integer':
+      return uniqueIntegerDomain(info, columnName);
+    case 'decimal':
+      return uniqueDecimalDomain(info);
+    case 'float':
+      return uniqueFloatDomain();
+    case 'boolean':
+      return uniqueBooleanDomain(dialect);
+    case 'date':
+      return uniqueDateDomain();
+    case 'timestamp':
+      return uniqueTimestampDomain();
+    case 'time':
+      return uniqueTimeDomain();
+    case 'text':
+      return uniqueTextDomain(info.maxLength);
+    case 'uuid':
+    case 'json':
+    case 'array':
+    case 'unknown':
+    default:
+      return null;
+  }
+}
+
+/**
+ * `count` distinct indices drawn from [0, capacity). Below the threshold, a full shuffled
+ * permutation is cheap and also correct when count is close to capacity (the domain-too-small
+ * cap in buildGenerationPlan guarantees count <= capacity, so "close to capacity" does happen —
+ * e.g. a BOOLEAN UNIQUE column always asks for all of its 2 values). Above the threshold,
+ * materializing the full domain would be wasteful or impossible (a wide UNIQUE text column's
+ * domain is in the trillions), but count is always tiny relative to capacity there, so random
+ * retries with a Set converge immediately.
+ */
+const FULL_SHUFFLE_THRESHOLD = 200_000;
+function sampleDistinctIndices(capacity: number, count: number): number[] {
+  if (capacity <= FULL_SHUFFLE_THRESHOLD) {
+    const indices = Array.from({ length: capacity }, (_, i) => i);
+    for (let i = indices.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [indices[i], indices[j]] = [indices[j], indices[i]];
+    }
+    return indices.slice(0, count);
+  }
+  const seen = new Set<number>();
+  while (seen.size < count) seen.add(Math.floor(Math.random() * capacity));
+  return Array.from(seen);
+}
+
+/** `count` distinct UUIDs. Collisions are astronomically unlikely; guarded anyway for a real guarantee. */
+function generateDistinctUuids(count: number): string[] {
+  const seen = new Set<string>();
+  while (seen.size < count) seen.add(randomUUID());
+  return Array.from(seen, (id) => `'${id}'`);
+}
+
+/**
+ * Pre-generates every value-only UNIQUE column's full set of distinct values for one table, up
+ * front, before any row is built — the same reason PK pools and 1:1 parent pools are built ahead
+ * of the per-row loop: an individual row can't know, by itself, whether its value collides with
+ * a row generated later. `rowCount` is assumed already capacity-capped by buildGenerationPlan.
+ */
+function buildUniqueValuePools(table: ValidatedTable, rowCount: number, dialect: Dialect): Map<string, (string | number)[]> {
+  const pools = new Map<string, (string | number)[]>();
+  for (const colName of valueOnlyUniqueColumns(table)) {
+    const info = table.columnInfo[colName] ?? UNKNOWN_COLUMN;
+    if (info.kind === 'uuid') {
+      pools.set(colName, generateDistinctUuids(rowCount));
+      continue;
+    }
+    const domain = uniqueDomainForColumn(info, colName, dialect);
+    if (!domain) continue; // unsupported kind — schema-analysis already warned; old behavior stands
+    pools.set(colName, sampleDistinctIndices(domain.capacity, rowCount).map(domain.valueAt));
+  }
+  return pools;
+}
+
 export type PkPools = Map<string, (number | string)[]>;
 
 /** The SQL literal for a primary-key value taken from a pool: uuids are quoted, integers are not. */
@@ -412,6 +693,27 @@ export function* generateTableRows(
     }
   }
 
+  // Every value-only UNIQUE column's full, distinct value set — see buildUniqueValuePools.
+  const uniqueValuePools = buildUniqueValuePools(table, rowCount, dialect);
+
+  // Every UNIQUE (non-PK) foreign key's assignment: `rowCount` distinct parent keys, shuffled
+  // once up front (buildGenerationPlan already guarantees rowCount <= the parent's pool size —
+  // the same cap it applies to a 1:1 table's PK-that-is-FK). A nullable FK whose parent hasn't
+  // been generated yet (the parent pool is still empty) is left out here on purpose: that is the
+  // cycle-break case below, where every row of the column is NULL regardless, and NULLs never
+  // collide, so there is nothing to sample.
+  const uniqueFkPools = new Map<string, readonly (number | string)[]>();
+  for (const uniqueFk of uniqueForeignKeys(table)) {
+    const parentPool = pkPools.get(uniqueFk.referencesTable);
+    if (!parentPool || parentPool.length === 0) continue;
+    const shuffled = parentPool.slice();
+    for (let i = shuffled.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
+    uniqueFkPools.set(uniqueFk.column, shuffled.slice(0, rowCount));
+  }
+
   for (let i = 1; i <= rowCount; i++) {
     const row: Record<string, string | number> = {};
 
@@ -451,6 +753,11 @@ export function* generateTableRows(
           row[colName] = selfReferenceValue(pool, ownPk, table.notNull[colName] === false);
           continue;
         }
+        const uniqueFkPool = uniqueFkPools.get(colName);
+        if (uniqueFkPool) {
+          row[colName] = keyLiteral(uniqueFkPool[i - 1]);
+          continue;
+        }
         const parentPool = pkPools.get(fk.referencesTable) ?? [];
         if (parentPool.length === 0) {
           // A nullable FK to a later-generated parent (cycle broken by this column): NULL is the only valid value.
@@ -468,12 +775,11 @@ export function* generateTableRows(
         continue;
       }
 
-      row[colName] = generateColumnValue(
-        table.columnTypes[colName],
-        table.columnInfo[colName] ?? UNKNOWN_COLUMN,
-        { index: i, dialect },
-        colName
-      );
+      const uniqueValuePool = uniqueValuePools.get(colName);
+      row[colName] =
+        uniqueValuePool !== undefined
+          ? uniqueValuePool[i - 1]
+          : generateColumnValue(table.columnTypes[colName], table.columnInfo[colName] ?? UNKNOWN_COLUMN, { index: i, dialect }, colName);
     }
 
     if (ownPk !== undefined) pool.push(ownPk);

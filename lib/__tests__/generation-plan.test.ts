@@ -7,7 +7,7 @@ import {
   type PkPools,
 } from '../generation-plan';
 import type { ValidatedSemanticMap, ValidatedTable } from '../schema-analysis';
-import { classifyColumnType, type ColumnTypeInfo } from '../sql-types';
+import { classifyColumnType, TINYINT_MAX, type ColumnTypeInfo } from '../sql-types';
 
 const LIMITS = { baseParentRows: 15, maxRows: 10_000, minRows: 1 };
 
@@ -22,6 +22,8 @@ function table(
     foreignKeys?: ValidatedTable['foreignKeys'];
     /** Columns declared NOT NULL (the primary key always is). Every other column is nullable. */
     notNull?: string[];
+    /** Columns with a single-column UNIQUE constraint (never the primary key). */
+    uniqueColumns?: string[];
   }
 ): ValidatedTable {
   const primaryKey = opts.primaryKey ?? { column: 'id', kind: 'integer' as const };
@@ -37,6 +39,7 @@ function table(
     ),
     primaryKey,
     foreignKeys: opts.foreignKeys ?? [],
+    uniqueColumns: opts.uniqueColumns ?? [],
   };
 }
 
@@ -829,5 +832,215 @@ describe('buildGenerationPlan: 1:1 tables (a primary key that is also a foreign 
     const userIds = new Set(pools.get('users'));
     expect(rows.user_profiles).toHaveLength(15);
     for (const row of rows.user_profiles) expect(userIds.has(row.user_id as number)).toBe(true);
+  });
+});
+
+describe('buildGenerationPlan & generateTableRows: UNIQUE value-only columns', () => {
+  function single(sqlType: string, opts: { rows?: number; semantic?: ValidatedTable['columnTypes'][string] } = {}) {
+    const t = table('t', {
+      columns: ['id', 'col'],
+      columnTypes: { id: 'pk', col: opts.semantic ?? 'string' },
+      sqlTypes: { col: sqlType },
+      uniqueColumns: ['col'],
+    });
+    const plan = buildGenerationPlan(mapOf([t], ['t']), opts.rows ?? 300, LIMITS);
+    const rows = runAll(new Map(), plan).t;
+    return { plan, values: rows.map((r) => r.col) };
+  }
+
+  it('gives a plain INT UNIQUE column distinct values within its 1..1000 domain', () => {
+    const { plan, values } = single('INT', { rows: 300 });
+    expect(plan.warnings).toEqual([]);
+    expect(new Set(values).size).toBe(values.length);
+    expect(values.every((v) => Number.isInteger(v) && (v as number) >= 1 && (v as number) <= 1000)).toBe(true);
+  });
+
+  it('caps a BOOLEAN UNIQUE column at 2 rows and reports why', () => {
+    const { plan, values } = single('BOOLEAN', { rows: 500 });
+    expect(plan.tables[0].rowCount).toBe(2);
+    expect(plan.warnings).toHaveLength(1);
+    expect(plan.warnings[0]).toMatch(/t\.col/);
+    expect(plan.warnings[0]).toMatch(/room for 2 distinct value/);
+    expect(plan.warnings[0]).toMatch(/capped at 2 row/);
+    expect(new Set(values)).toEqual(new Set(['TRUE', 'FALSE']));
+  });
+
+  it('caps a TINYINT UNIQUE column at its real range (matches TINYINT_MAX) and reports why', () => {
+    const { plan, values } = single('TINYINT', { rows: 500 });
+    expect(plan.tables[0].rowCount).toBe(TINYINT_MAX);
+    expect(plan.warnings[0]).toMatch(new RegExp(`room for ${TINYINT_MAX} distinct value`));
+    expect(new Set(values).size).toBe(TINYINT_MAX);
+  });
+
+  it('caps a narrow VARCHAR(2) UNIQUE column at its base-36 domain (36^2 = 1296) and reports why', () => {
+    const { plan, values } = single('VARCHAR(2)', { rows: 5000, semantic: 'phone' });
+    expect(plan.tables[0].rowCount).toBe(1296);
+    expect(plan.warnings[0]).toMatch(/room for 1296 distinct value/);
+    expect(new Set(values).size).toBe(1296);
+    expect(values.every((v) => typeof v === 'string' && /^'[0-9a-z]{1,2}'$/.test(v))).toBe(true);
+  });
+
+  it('UNIQUE text values survive truncation to the declared VARCHAR(n) length — no post-truncation collisions', () => {
+    const { plan, values } = single('VARCHAR(3)', { rows: 2000, semantic: 'email' });
+    // 36^3 = 46656, comfortably above 2000.
+    expect(plan.tables[0].rowCount).toBe(2000);
+    for (const v of values) {
+      const raw = String(v).slice(1, -1); // strip quotes
+      expect(raw.length).toBeLessThanOrEqual(3);
+    }
+    expect(new Set(values).size).toBe(values.length);
+  });
+
+  it('generates distinct DECIMAL UNIQUE values that fit (precision, scale)', () => {
+    const { plan, values } = single('DECIMAL(4,2)', { rows: 3000 });
+    // intDigits=2 -> 100 whole-number values * 100 fractional values = 10,000 capacity.
+    expect(plan.warnings).toEqual([]);
+    expect(new Set(values).size).toBe(values.length);
+    for (const v of values) {
+      const [intPart, fracPart] = String(v).split('.');
+      expect(intPart.length + (fracPart?.length ?? 0)).toBeLessThanOrEqual(4);
+      expect(fracPart).toHaveLength(2);
+    }
+  });
+
+  it('generates distinct FLOAT, DATE, TIMESTAMP, TIME and UUID UNIQUE values at several thousand rows', () => {
+    for (const [sqlType, semantic] of [
+      ['REAL', undefined],
+      ['DATE', undefined],
+      ['TIMESTAMP', undefined],
+      ['TIME', undefined],
+      ['UUID', undefined],
+    ] as const) {
+      const { plan, values } = single(sqlType, { rows: 4000, semantic });
+      expect(plan.warnings, `${sqlType} should not need capping at 4000 rows`).toEqual([]);
+      expect(plan.tables[0].rowCount).toBe(4000);
+      expect(new Set(values).size, `${sqlType} values should all be distinct`).toBe(4000);
+    }
+  });
+
+  it('caps a table at the smallest of several simultaneous UNIQUE-column capacities', () => {
+    const t = table('t', {
+      columns: ['id', 'flag', 'code'],
+      columnTypes: { id: 'pk', flag: 'boolean', code: 'string' },
+      sqlTypes: { flag: 'BOOLEAN', code: 'VARCHAR(2)' }, // capacities 2 and 1296
+      uniqueColumns: ['flag', 'code'],
+    });
+    const plan = buildGenerationPlan(mapOf([t], ['t']), 5000, LIMITS);
+    expect(plan.tables[0].rowCount).toBe(2); // the smaller of the two binding constraints
+    // Only the binding (flag) constraint is reported — code's larger capacity never bound anything.
+    expect(plan.warnings).toHaveLength(1);
+    expect(plan.warnings[0]).toMatch(/t\.flag/);
+  });
+
+  it('does not cap or warn when capacity comfortably exceeds the requested rows', () => {
+    const { plan } = single('INT', { rows: 100 });
+    expect(plan.warnings).toEqual([]);
+    expect(plan.tables[0].rowCount).toBe(100);
+  });
+
+  it('an ordinary (non-UNIQUE) column of the same type is unaffected — may repeat, never capped', () => {
+    const t = table('t', {
+      columns: ['id', 'flag'],
+      columnTypes: { id: 'pk', flag: 'boolean' },
+      sqlTypes: { flag: 'BOOLEAN' },
+      // no uniqueColumns
+    });
+    const plan = buildGenerationPlan(mapOf([t], ['t']), 500, LIMITS);
+    expect(plan.tables[0].rowCount).toBe(500);
+    expect(plan.warnings).toEqual([]);
+  });
+});
+
+describe('buildGenerationPlan & generateTableRows: UNIQUE foreign keys (not the primary key)', () => {
+  const users = table('users', { columns: ['id', 'email'], columnTypes: { id: 'pk', email: 'email' } });
+
+  function profiles(opts: { extraFk?: ValidatedTable['foreignKeys'][number] } = {}) {
+    return table('user_profiles', {
+      columns: opts.extraFk ? ['id', 'user_id', opts.extraFk.column] : ['id', 'user_id'],
+      columnTypes: opts.extraFk
+        ? { id: 'pk', user_id: 'fk', [opts.extraFk.column]: 'fk' }
+        : { id: 'pk', user_id: 'fk' },
+      foreignKeys: [
+        { column: 'user_id', referencesTable: 'users', referencesColumn: 'id' },
+        ...(opts.extraFk ? [opts.extraFk] : []),
+      ],
+      uniqueColumns: ['user_id'],
+    });
+  }
+
+  it('caps a UNIQUE (non-PK) FK at its parent row count and reports why', () => {
+    const plan = buildGenerationPlan(mapOf([users, profiles()], ['users', 'user_profiles']), 500, LIMITS);
+    expect(plan.tables[0].rowCount).toBe(15);
+    expect(plan.tables[1].rowCount).toBe(15);
+    expect(plan.warnings).toHaveLength(1);
+    expect(plan.warnings[0]).toMatch(/user_profiles\.user_id/);
+    expect(plan.warnings[0]).toMatch(/UNIQUE foreign key/);
+    expect(plan.warnings[0]).toMatch(/"users"/);
+    expect(plan.warnings[0]).toMatch(/capped at 15 row/);
+  });
+
+  it('does not cap or warn when the requested count already fits within the parent', () => {
+    const plan = buildGenerationPlan(mapOf([users, profiles()], ['users', 'user_profiles']), 20, LIMITS);
+    expect(plan.warnings).toEqual([]);
+  });
+
+  it('every row gets a distinct key that really exists in the parent (sampled without replacement)', () => {
+    for (let i = 0; i < 30; i++) {
+      const requested = 20 + Math.floor(Math.random() * 2000);
+      const pools: PkPools = new Map();
+      const plan = buildGenerationPlan(mapOf([users, profiles()], ['users', 'user_profiles']), requested, LIMITS);
+      const rows = runAll(pools, plan);
+      const userIds = new Set(pools.get('users'));
+      const seen = new Set<string | number>();
+      for (const row of rows.user_profiles) {
+        expect(userIds.has(row.user_id as number)).toBe(true);
+        expect(seen.has(row.user_id)).toBe(false);
+        seen.add(row.user_id);
+      }
+    }
+  });
+
+  it('a UNIQUE FK combined with an ordinary FK to a different parent: both correct at once', () => {
+    const companies = table('companies', { columns: ['id'], columnTypes: { id: 'pk' } });
+    const withCompany = profiles({
+      extraFk: { column: 'company_id', referencesTable: 'companies', referencesColumn: 'id' },
+    });
+    const pools: PkPools = new Map();
+    const plan = buildGenerationPlan(
+      mapOf([users, companies, withCompany], ['users', 'companies', 'user_profiles']),
+      300,
+      LIMITS
+    );
+    const rows = runAll(pools, plan);
+    const userIds = new Set(pools.get('users'));
+    const companyIds = new Set(pools.get('companies'));
+    const seenUserIds = new Set<string | number>();
+    expect(rows.user_profiles.length).toBeGreaterThan(0);
+    for (const row of rows.user_profiles) {
+      expect(userIds.has(row.user_id as number)).toBe(true); // unique FK: sampled without replacement
+      expect(seenUserIds.has(row.user_id)).toBe(false);
+      seenUserIds.add(row.user_id);
+      expect(companyIds.has(row.company_id as number)).toBe(true); // ordinary FK: unaffected, may repeat
+    }
+  });
+
+  it('a nullable UNIQUE FK to a later table (cycle break) is always NULL — not capped, no warning', () => {
+    const a = table('a', {
+      columns: ['id', 'b_id'],
+      columnTypes: { id: 'pk', b_id: 'fk' },
+      foreignKeys: [{ column: 'b_id', referencesTable: 'b', referencesColumn: 'id' }],
+      uniqueColumns: ['b_id'],
+    });
+    const b = table('b', {
+      columns: ['id', 'a_id'],
+      columnTypes: { id: 'pk', a_id: 'fk' },
+      foreignKeys: [{ column: 'a_id', referencesTable: 'a', referencesColumn: 'id' }],
+      notNull: ['a_id'],
+    });
+    const plan = buildGenerationPlan(mapOf([a, b], ['a', 'b']), 50, LIMITS);
+    expect(plan.warnings).toEqual([]);
+    expect(plan.tables[0].rowCount).toBe(15); // unchanged: NULLs never collide, so nothing to cap
+    const rows = runAll(new Map() as PkPools, plan);
+    expect(rows.a.every((r) => r.b_id === 'NULL')).toBe(true);
   });
 });

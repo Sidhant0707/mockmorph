@@ -10,15 +10,19 @@
  * Supported:
  *   - CREATE TABLE [IF NOT EXISTS] name ( ... );
  *   - Column-level: PRIMARY KEY, REFERENCES table(col), NOT NULL, UNIQUE, DEFAULT ...
- *   - Table-level: PRIMARY KEY (col), FOREIGN KEY (col) REFERENCES table(col)
+ *   - Table-level: PRIMARY KEY (col), FOREIGN KEY (col) REFERENCES table(col),
+ *     single-column UNIQUE (col)
  *   - Single-column primary keys (composite PKs are detected and reported,
  *     not silently handled as if they were single-column)
+ *   - Single-column UNIQUE constraints, column-level or table-level (composite
+ *     UNIQUE spanning multiple columns is detected and reported, not silently
+ *     handled as if it applied to one column)
  *   - quoted identifiers ("name", `name`)
  *
  * Explicitly not supported (skipped with a warning, not guessed at):
  *   - ALTER TABLE ... ADD CONSTRAINT
  *   - CREATE INDEX / CHECK constraints
- *   - composite primary/foreign keys spanning multiple columns
+ *   - composite primary/foreign/unique keys spanning multiple columns
  *   - schema-qualified names beyond a simple `schema.table` -> `table` strip
  */
 
@@ -49,6 +53,16 @@ export interface ParsedTable {
   primaryKey: { column: string; kind: PrimaryKeyKind } | null;
   foreignKeys: ParsedForeignKey[];
   hasCompositePrimaryKey: boolean;
+  /**
+   * Column names with a single-column UNIQUE constraint — from either column-level
+   * (`code INT UNIQUE`) or table-level (`UNIQUE (code)`) syntax. Never includes the
+   * primary-key column: a PK is already unique, so it is left out here to avoid a second,
+   * redundant enforcement path (see schema-analysis.ts / generation-plan.ts).
+   * A multi-column (composite) table-level UNIQUE is not represented here at all: it is
+   * reported as a parser warning instead (see the "composite UNIQUE" warning below), the
+   * same "warn, don't guess" treatment this parser already gives composite primary keys.
+   */
+  uniqueColumns: string[];
 }
 
 export interface ParseResult {
@@ -235,6 +249,10 @@ export function parseSchema(rawSql: string): ParseResult {
     const columns: ParsedColumn[] = [];
     const foreignKeys: ParsedForeignKey[] = [];
     const pkColumns: string[] = [];
+    // Single-column UNIQUE constraints seen so far, from either syntax. Deduped and filtered
+    // against pkColumns only once every def has been read (a table-level PRIMARY KEY can appear
+    // after a column that already named itself UNIQUE).
+    const uniqueColumnCandidates: string[] = [];
 
     for (const def of defs) {
       const trimmed = def.trim();
@@ -265,8 +283,22 @@ export function parseSchema(rawSql: string): ParseResult {
         continue;
       }
 
+      if (unwrappedLower.startsWith('unique')) {
+        const cols = unwrapped.match(/\(([^)]*)\)/);
+        const uniqueCols = cols ? cols[1].split(',').map((c) => stripQuotes(c)).filter(Boolean) : [];
+        if (uniqueCols.length === 1) {
+          uniqueColumnCandidates.push(uniqueCols[0]);
+        } else if (uniqueCols.length > 1) {
+          warnings.push(
+            `${name}: composite UNIQUE (${uniqueCols.join(', ')}) is not supported — this constraint is not enforced during generation`
+          );
+        } else {
+          warnings.push(`${name}: could not parse table-level UNIQUE clause "${trimmed}"`);
+        }
+        continue;
+      }
+
       if (
-        unwrappedLower.startsWith('unique') ||
         unwrappedLower.startsWith('check') ||
         unwrappedLower.startsWith('index') ||
         unwrappedLower.startsWith('key ')
@@ -290,6 +322,8 @@ export function parseSchema(rawSql: string): ParseResult {
 
       const isInlinePk = /\bprimary\s+key\b/.test(restLower);
       if (isInlinePk) pkColumns.push(colName);
+
+      if (/\bunique\b/.test(restLower)) uniqueColumnCandidates.push(colName);
 
       const refMatch = rest.match(REFERENCES_RE);
       let isForeignKey = false;
@@ -326,7 +360,11 @@ export function parseSchema(rawSql: string): ParseResult {
       );
     }
 
-    return { name, columns, primaryKey, foreignKeys, hasCompositePrimaryKey };
+    // A PK is already unique — leaving it out of uniqueColumns keeps its enforcement on the
+    // existing, single PK-pool code path instead of a second, redundant one.
+    const uniqueColumns = Array.from(new Set(uniqueColumnCandidates)).filter((c) => !uniquePkCols.includes(c));
+
+    return { name, columns, primaryKey, foreignKeys, hasCompositePrimaryKey, uniqueColumns };
   });
 
   return { tables, warnings };

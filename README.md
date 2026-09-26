@@ -10,6 +10,7 @@ Table structure (order, primary keys, foreign keys) is worked out **locally** by
 - **Correct foreign keys.** Every table keeps a pool of the primary keys it generated. A foreign key picks its value from the pool of the table its `REFERENCES` clause names, however many tables sit in between.
 - **Self-referencing foreign keys.** A table can reference its own primary key (for example `employees.manager_id REFERENCES employees(id)`), with integer or UUID keys, inline or table-level, and any number of such columns per table. A row may only point at a row generated earlier in the same table, so the data is always a valid hierarchy with no cycles. A nullable column gets `NULL` for the first row (a root) and for about a fifth of the rest; a `NOT NULL` column makes the first row reference itself, which PostgreSQL accepts but has not been verified on MySQL.
 - **1:1 tables (a primary key that is also a foreign key).** A table like `user_profiles(user_id INT PRIMARY KEY REFERENCES users(id))` gets its keys sampled from the parent's own generated primary keys, so every row is a real parent row and no two rows share one. Chains of these (`a <- b <- c`) work the same way. If the requested row count would exceed the parent's, the table is capped at the parent's row count instead, with a warning explaining why.
+- **UNIQUE columns.** A single-column `UNIQUE` constraint (`code INT UNIQUE`, or table-level `UNIQUE (code)`) is enforced, not just parsed: every generated value is guaranteed distinct across the table's rows, for integer, decimal, float, text, date, timestamp, time and UUID columns — text distinctness holds up even after truncation to a declared `VARCHAR(n)`/`CHAR(n)` length. A `UNIQUE` foreign key that is not the table's primary key (`user_id INT UNIQUE REFERENCES users(id)`) samples the parent's keys without replacement, the same as a 1:1 table. If a column's type has too small a value space for the requested row count (`BOOLEAN UNIQUE`, a narrow `VARCHAR(2) UNIQUE`, ...), the table is capped at that value space instead, with a warning explaining why — the same choice already made for 1:1 tables, applied consistently. A composite (multi-column) `UNIQUE` is not enforced; it is reported as a warning instead. Neither is a `UNIQUE` self-referencing foreign key.
 - **Integer and UUID primary keys.** Integer keys are sequential; UUID keys are real random UUIDs.
 - **Streaming output.** Results stream to the terminal-style UI as they are generated. Copy them or download as `.sql`.
 - **AI semantic labels, with overrides.** Analyze a schema once, adjust any column's type in the UI, and reuse that classification without spending another AI call.
@@ -147,15 +148,18 @@ Supported:
 - `CREATE TABLE [IF NOT EXISTS] name (...)`
 - Column-level `PRIMARY KEY`, `REFERENCES table(col)`, `NOT NULL`, `UNIQUE`, `DEFAULT`
 - Table-level `PRIMARY KEY (col)` and `FOREIGN KEY (col) REFERENCES table(col)`
+- Single-column `UNIQUE`, column-level or table-level (`UNIQUE (col)`) — enforced during generation, see Features above
 - Foreign keys that reference the table's own primary key (self-references)
 - Integer primary keys (`INT`, `INTEGER`, `SMALLINT`, `BIGINT`, `SERIAL`, `BIGSERIAL`, `SMALLSERIAL`) and `UUID` primary keys
 - Quoted identifiers (`"name"`, `` `name` ``)
 
 Not supported yet:
 
-- Composite (multi-column) primary or foreign keys
+- Composite (multi-column) primary, foreign, or `UNIQUE` keys
 - Primary keys of other types (e.g. `TEXT`, `VARCHAR`)
 - Foreign keys that reference a column other than the parent's primary key
+- A `UNIQUE` self-referencing foreign key (parsed and reported with a warning, not enforced)
+- A `UNIQUE` column of an unsupported kind — `json`/`array`/unrecognized types (parsed and reported with a warning, not enforced)
 - `ALTER TABLE ... ADD CONSTRAINT`, `CREATE INDEX` and `CHECK` constraints (skipped with a warning)
 
 ## Known limitations
