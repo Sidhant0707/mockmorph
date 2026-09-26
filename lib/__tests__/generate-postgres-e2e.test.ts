@@ -602,3 +602,160 @@ describe('1:1 tables (a primary key that is also a foreign key)', () => {
     await assertOneToOne('c', 'id', 'b');
   });
 });
+describe('UNIQUE columns', () => {
+  /** Every value in the column must be distinct (Postgres itself only checks this if it's really UNIQUE). */
+  async function assertColumnDistinct(table: string, col: string): Promise<void> {
+    const dup = await db.query<{ total: number; distinct: number }>(
+      `SELECT count(*)::int AS total, count(DISTINCT "${col}")::int AS distinct FROM "${table}"`
+    );
+    expect(dup.rows[0].distinct).toBe(dup.rows[0].total);
+  }
+
+  it('the exact reported repros no longer produce a duplicate key error', async () => {
+    const intSchema = `CREATE TABLE t (id SERIAL PRIMARY KEY, code INT UNIQUE);`;
+    const intSql = await generateSql(intSchema, { rows: 800 });
+    await loadIntoPostgres(intSchema, intSql);
+    expect(await count('t')).toBe(800);
+    await assertColumnDistinct('t', 'code');
+
+    await db.exec('DROP SCHEMA public CASCADE; CREATE SCHEMA public;');
+    const phoneSchema = `CREATE TABLE t (id SERIAL PRIMARY KEY, phone VARCHAR(30) UNIQUE);`;
+    const phoneSql = await generateSql(phoneSchema, { rows: 300, cachedColumnTypes: { t: { phone: 'phone' } } });
+    await loadIntoPostgres(phoneSchema, phoneSql);
+    expect(await count('t')).toBe(300);
+    await assertColumnDistinct('t', 'phone');
+  });
+
+  it('table-level UNIQUE (col) is now enforced, not just parsed', async () => {
+    const schema = `CREATE TABLE t (id SERIAL PRIMARY KEY, code INT, UNIQUE (code));`;
+    const sql = await generateSql(schema, { rows: 800 });
+    await loadIntoPostgres(schema, sql);
+    expect(await count('t')).toBe(800);
+    await assertColumnDistinct('t', 'code');
+  });
+
+  it('every UNIQUE kind stays distinct at several thousand rows, and none of it collides after real INSERTs', async () => {
+    const schema = `
+      CREATE TABLE t (
+        id SERIAL PRIMARY KEY,
+        u_decimal DECIMAL(6,2) UNIQUE,
+        u_float REAL UNIQUE,
+        u_text VARCHAR(50) UNIQUE,
+        u_date DATE UNIQUE,
+        u_timestamp TIMESTAMP UNIQUE,
+        u_time TIME UNIQUE,
+        u_uuid UUID UNIQUE
+      );`;
+    const rows = 4000;
+    const sql = await generateSql(schema, { rows, cachedColumnTypes: { t: { u_text: 'email' } } });
+    expect(sql).not.toContain('[WARN]'); // none of these should need capping at 4000 rows
+    await loadIntoPostgres(schema, sql);
+    expect(await count('t')).toBe(rows);
+    for (const col of ['u_decimal', 'u_float', 'u_text', 'u_date', 'u_timestamp', 'u_time', 'u_uuid']) {
+      await assertColumnDistinct('t', col);
+    }
+  });
+
+  it('UNIQUE text values survive truncation to the declared VARCHAR(n)/CHAR(n) length', async () => {
+    const schema = `
+      CREATE TABLE t (
+        id SERIAL PRIMARY KEY,
+        v3 VARCHAR(3) UNIQUE,
+        c2 CHAR(2) UNIQUE
+      );`;
+    const sql = await generateSql(schema, {
+      rows: 1000,
+      cachedColumnTypes: { t: { v3: 'email', c2: 'string' } },
+    });
+    await loadIntoPostgres(schema, sql);
+    expect(await count('t')).toBe(1000);
+    await assertColumnDistinct('t', 'v3');
+    await assertColumnDistinct('t', 'c2');
+    const tooLong = await db.query("SELECT 1 FROM t WHERE length(v3) > 3");
+    expect(tooLong.rows).toHaveLength(0);
+  });
+
+  it('BOOLEAN UNIQUE is capped to 2 rows instead of reaching Postgres with a bad INSERT', async () => {
+    const schema = `CREATE TABLE t (id SERIAL PRIMARY KEY, flag BOOLEAN UNIQUE);`;
+    const sql = await generateSql(schema, { rows: 500 });
+    expect(sql).toContain('[WARN]');
+    expect(sql).toMatch(/t\.flag/);
+    expect(sql).toMatch(/capped at 2 row/);
+    await loadIntoPostgres(schema, sql);
+    expect(await count('t')).toBe(2);
+    await assertColumnDistinct('t', 'flag');
+  });
+
+  it('a narrow VARCHAR(2) UNIQUE column is capped to its real value space (36^2 = 1296)', async () => {
+    const schema = `CREATE TABLE t (id SERIAL PRIMARY KEY, code VARCHAR(2) UNIQUE);`;
+    const sql = await generateSql(schema, { rows: 5000, cachedColumnTypes: { t: { code: 'phone' } } });
+    expect(sql).toContain('[WARN]');
+    expect(sql).toMatch(/capped at 1296 row/);
+    await loadIntoPostgres(schema, sql);
+    expect(await count('t')).toBe(1296);
+    await assertColumnDistinct('t', 'code');
+  });
+
+  it('the UNIQUE-FK pattern (user_id INT UNIQUE REFERENCES users(id)) combined with an ordinary FK on the same table', async () => {
+    const schema = `
+      CREATE TABLE users (id SERIAL PRIMARY KEY, email VARCHAR(100));
+      CREATE TABLE companies (id SERIAL PRIMARY KEY, name TEXT);
+      CREATE TABLE profiles (
+        id SERIAL PRIMARY KEY,
+        user_id INT UNIQUE REFERENCES users(id),
+        company_id INT NOT NULL REFERENCES companies(id)
+      );`;
+    const sql = await generateSql(schema, { rows: 500 });
+    expect(sql).toContain('[WARN]');
+    expect(sql).toMatch(/profiles\.user_id/);
+    expect(sql).toMatch(/UNIQUE foreign key/);
+    await loadIntoPostgres(schema, sql);
+    expect(await count('profiles')).toBe(15); // capped to match users, same as the 1:1 case
+    await assertColumnDistinct('profiles', 'user_id');
+    const orphanUsers = await db.query(
+      'SELECT 1 FROM profiles p LEFT JOIN users u ON u.id = p.user_id WHERE u.id IS NULL'
+    );
+    expect(orphanUsers.rows).toHaveLength(0);
+    const orphanCompanies = await db.query(
+      'SELECT 1 FROM profiles p LEFT JOIN companies c ON c.id = p.company_id WHERE c.id IS NULL'
+    );
+    expect(orphanCompanies.rows).toHaveLength(0);
+    // company_id is an ordinary FK, not UNIQUE — it is allowed (though not required) to repeat.
+  });
+
+  it('composite UNIQUE (a, b) is not silently ignored: a warning is produced and generation still succeeds', async () => {
+    const schema = `
+      CREATE TABLE t (
+        id SERIAL PRIMARY KEY,
+        a INT,
+        b INT,
+        UNIQUE (a, b)
+      );`;
+    const sql = await generateSql(schema, { rows: 100 });
+    await loadIntoPostgres(schema, sql);
+    expect(await count('t')).toBe(100);
+  });
+
+  it('non-UNIQUE columns of the same types are unaffected: no cap, duplicates allowed', async () => {
+    const schema = `
+      CREATE TABLE t (
+        id SERIAL PRIMARY KEY,
+        flag BOOLEAN,
+        code VARCHAR(2)
+      );`;
+    const sql = await generateSql(schema, { rows: 500, cachedColumnTypes: { t: { code: 'phone' } } });
+    expect(sql).not.toContain('[WARN]');
+    await loadIntoPostgres(schema, sql);
+    expect(await count('t')).toBe(500);
+  });
+
+  it('a UNIQUE self-referencing foreign key is a documented, warned gap, not a silent one', async () => {
+    // Out of scope for this fix (see the warning schema-analysis.ts emits for this case): a
+    // self-referencing FK still samples with replacement, so a real duplicate-key rejection from
+    // Postgres is possible, not prevented. This only confirms generation itself completes rather
+    // than crashing — it deliberately does not assert the INSERT succeeds, since it may not.
+    const schema = `CREATE TABLE t (id SERIAL PRIMARY KEY, parent_id INT UNIQUE REFERENCES t(id));`;
+    const sql = await generateSql(schema, { rows: 5 });
+    expect(sql).toContain('INSERT INTO');
+  });
+});

@@ -129,11 +129,99 @@ describe('parseSchema', () => {
       CREATE TABLE users (
         id SERIAL PRIMARY KEY,
         email TEXT,
-        UNIQUE (email)
+        CHECK (email <> '')
       );
     `);
     expect(tables[0].columns.map((c) => c.name)).toEqual(['id', 'email']);
-    expect(warnings.some((w) => w.includes('UNIQUE'))).toBe(true);
+    expect(warnings.some((w) => w.includes('CHECK'))).toBe(true);
+  });
+});
+
+describe('UNIQUE columns', () => {
+  it('extracts a column-level UNIQUE', () => {
+    const { tables, warnings } = parseSchema(`
+      CREATE TABLE t (id SERIAL PRIMARY KEY, code INT UNIQUE);
+    `);
+    expect(tables[0].uniqueColumns).toEqual(['code']);
+    expect(warnings).toEqual([]);
+  });
+
+  it('extracts a single-column table-level UNIQUE (col)', () => {
+    const { tables, warnings } = parseSchema(`
+      CREATE TABLE users (
+        id SERIAL PRIMARY KEY,
+        email TEXT,
+        UNIQUE (email)
+      );
+    `);
+    expect(tables[0].uniqueColumns).toEqual(['email']);
+    expect(warnings).toEqual([]);
+  });
+
+  it('extracts a table-level UNIQUE with a CONSTRAINT name', () => {
+    const { tables } = parseSchema(`
+      CREATE TABLE users (id SERIAL PRIMARY KEY, email TEXT, CONSTRAINT uq_email UNIQUE (email));
+    `);
+    expect(tables[0].uniqueColumns).toEqual(['email']);
+  });
+
+  it('warns on a composite (multi-column) UNIQUE instead of silently dropping or misapplying it', () => {
+    const { tables, warnings } = parseSchema(`
+      CREATE TABLE t (
+        a INT,
+        b INT,
+        UNIQUE (a, b)
+      );
+    `);
+    expect(tables[0].uniqueColumns).toEqual([]);
+    expect(warnings.some((w) => w.includes('composite UNIQUE') && w.includes('a, b'))).toBe(true);
+  });
+
+  it('collects multiple distinct UNIQUE columns, column-level and table-level combined', () => {
+    const { tables } = parseSchema(`
+      CREATE TABLE t (
+        id SERIAL PRIMARY KEY,
+        code INT UNIQUE,
+        email TEXT,
+        phone TEXT,
+        UNIQUE (email)
+      );
+    `);
+    expect(tables[0].uniqueColumns.sort()).toEqual(['code', 'email']);
+  });
+
+  it('never includes the primary-key column, even if it is redundantly also marked UNIQUE', () => {
+    const { tables } = parseSchema('CREATE TABLE t (id SERIAL PRIMARY KEY UNIQUE, n INT);');
+    expect(tables[0].uniqueColumns).toEqual([]);
+    const { tables: t2 } = parseSchema(`
+      CREATE TABLE t (id SERIAL, n INT, PRIMARY KEY (id), UNIQUE (id));
+    `);
+    expect(t2[0].uniqueColumns).toEqual([]);
+  });
+
+  it('dedupes a column named UNIQUE both inline and at table level', () => {
+    const { tables } = parseSchema(`
+      CREATE TABLE t (id SERIAL PRIMARY KEY, code INT UNIQUE, UNIQUE (code));
+    `);
+    expect(tables[0].uniqueColumns).toEqual(['code']);
+  });
+
+  it('handles quoted identifiers in both UNIQUE forms', () => {
+    const { tables } = parseSchema(`
+      CREATE TABLE "Users" ("Id" SERIAL PRIMARY KEY, "Email" TEXT UNIQUE, "Phone" TEXT, UNIQUE ("Phone"));
+    `);
+    expect(tables[0].uniqueColumns.sort()).toEqual(['Email', 'Phone']);
+  });
+
+  it('a UNIQUE foreign key is recorded as both a foreign key and a unique column', () => {
+    const { tables } = parseSchema(`
+      CREATE TABLE user_profiles (
+        id SERIAL PRIMARY KEY,
+        user_id INT UNIQUE REFERENCES users(id)
+      );
+    `);
+    expect(tables[0].uniqueColumns).toEqual(['user_id']);
+    expect(tables[0].foreignKeys).toEqual([{ column: 'user_id', referencesTable: 'users', referencesColumn: 'id' }]);
   });
 });
 

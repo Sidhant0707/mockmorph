@@ -160,3 +160,37 @@ describe('declared SQL types reach the generator', () => {
     expect(map.warnings.filter((w) => w.includes('not recognized'))).toEqual([]);
   });
 });
+
+describe('UNIQUE columns reach the validated table', () => {
+  it('threads uniqueColumns through, excluding the primary key', async () => {
+    const map = await buildValidatedSemanticMap(
+      `CREATE TABLE t (id SERIAL PRIMARY KEY, code INT UNIQUE, email TEXT, UNIQUE (email));`,
+      { t: {} }
+    );
+    expect(map.tables.t.uniqueColumns.sort()).toEqual(['code', 'email']);
+  });
+
+  it('warns about a UNIQUE column of a kind generation cannot enforce distinctness for', async () => {
+    const map = await buildValidatedSemanticMap('CREATE TABLE t (id SERIAL PRIMARY KEY, tags JSONB UNIQUE);', {
+      t: {},
+    });
+    expect(map.tables.t.uniqueColumns).toEqual(['tags']);
+    expect(map.warnings.some((w) => w.includes('t.tags') && w.includes('UNIQUE'))).toBe(true);
+  });
+
+  it('warns about a UNIQUE self-referencing foreign key instead of silently allowing duplicates', async () => {
+    const map = await buildValidatedSemanticMap(
+      'CREATE TABLE t (id SERIAL PRIMARY KEY, parent_code INT UNIQUE REFERENCES t(id));',
+      { t: {} }
+    );
+    expect(map.warnings.some((w) => w.includes('t.parent_code') && w.includes('self-referencing'))).toBe(true);
+  });
+
+  it('does not warn about an ordinary UNIQUE integer/text column', async () => {
+    const map = await buildValidatedSemanticMap(
+      'CREATE TABLE t (id SERIAL PRIMARY KEY, code INT UNIQUE, email VARCHAR(50) UNIQUE);',
+      { t: {} }
+    );
+    expect(map.warnings.filter((w) => !w.includes('cached semantic classification'))).toEqual([]);
+  });
+});

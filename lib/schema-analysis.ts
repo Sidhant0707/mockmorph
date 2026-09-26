@@ -38,6 +38,14 @@ export interface ValidatedTable {
   notNull: Record<string, boolean>;
   primaryKey: { column: string; kind: Exclude<PrimaryKeyKind, 'unsupported'> } | null;
   foreignKeys: { column: string; referencesTable: string; referencesColumn: string }[];
+  /**
+   * Columns with a single-column UNIQUE constraint (see ParsedTable.uniqueColumns — the
+   * primary-key column is never included). generation-plan.ts enforces this: a value-only
+   * unique column gets distinct generated values (capped or rejected if its value space is
+   * too small for the requested row count); a unique column that is also a foreign key
+   * samples the parent's keys without replacement, the same way a 1:1 table's PK-as-FK does.
+   */
+  uniqueColumns: string[];
 }
 
 export interface ValidatedSemanticMap {
@@ -246,6 +254,25 @@ function buildValidatedTables(
       }
     }
 
+    // UNIQUE enforcement only covers the column kinds generation-plan.ts knows how to generate
+    // distinct values for (or, for a unique FK, sample without replacement for). A column of an
+    // unsupported kind (json, array, unknown) keeps its old, unenforced behavior — reported here
+    // rather than guessed at, the same treatment the parser already gives composite UNIQUE.
+    for (const colName of t.uniqueColumns) {
+      const kind = columnInfo[colName]?.kind;
+      if (kind === 'json' || kind === 'array' || kind === 'unknown') {
+        warnings.push(
+          `${t.name}.${colName} is UNIQUE but of a type (${columnInfo[colName].raw || kind}) generation cannot guarantee distinct values for; it is generated as before, and duplicates are possible.`
+        );
+      }
+      const fk = t.foreignKeys.find((f) => f.column === colName);
+      if (fk && fk.referencesTable === t.name) {
+        warnings.push(
+          `${t.name}.${colName} is a UNIQUE self-referencing foreign key; uniqueness is not enforced for self-references, and duplicates are possible.`
+        );
+      }
+    }
+
     validated[t.name] = {
       name: t.name,
       columns: t.columns.map((c) => c.name),
@@ -261,6 +288,7 @@ function buildValidatedTables(
         referencesTable: fk.referencesTable,
         referencesColumn: fk.referencesColumn,
       })),
+      uniqueColumns: t.uniqueColumns,
     };
   }
 
