@@ -474,7 +474,7 @@ function uniqueDecimalDomain(info: ColumnTypeInfo): UniqueDomain {
     return { capacity: 1, valueAt: () => onlyValue };
   }
   const intRange = intDigits === 0 ? 1 : Math.min(5001, 10 ** Math.min(intDigits, 4));
-  const fracRange = scale === 0 ? 1 : 10 ** scale;
+  const fracRange = scale === 0 ? 1 : 10 ** Math.min(scale, 4);
   return {
     capacity: intRange * fracRange,
     valueAt: (index) => {
