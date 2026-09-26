@@ -159,6 +159,16 @@ function stripQuotes(id: string): string {
   return id.trim().replace(/^["'`[]|["'`\]]$/g, '');
 }
 
+/**
+ * Blanks out the contents of single- and double-quoted string literals (SQL's doubled-quote
+ * escape for a literal quote character included), so a keyword search over the remainder can't
+ * be fooled by that same word appearing inside a DEFAULT value or similar literal — e.g.
+ * `status TEXT DEFAULT 'unique'` should never be read as a UNIQUE constraint.
+ */
+function withoutQuotedLiterals(s: string): string {
+  return s.replace(/'(?:[^']|'')*'/g, "''").replace(/"(?:[^"]|"")*"/g, '""');
+}
+
 function lastPathSegment(qualified: string): string {
   const stripped = stripQuotes(qualified);
   const parts = stripped.split('.');
@@ -283,7 +293,7 @@ export function parseSchema(rawSql: string): ParseResult {
         continue;
       }
 
-      if (unwrappedLower.startsWith('unique')) {
+      if (/^unique(?:\s|\()/i.test(unwrapped)) {
         const cols = unwrapped.match(/\(([^)]*)\)/);
         const uniqueCols = cols ? cols[1].split(',').map((c) => stripQuotes(c)).filter(Boolean) : [];
         if (uniqueCols.length === 1) {
@@ -323,7 +333,10 @@ export function parseSchema(rawSql: string): ParseResult {
       const isInlinePk = /\bprimary\s+key\b/.test(restLower);
       if (isInlinePk) pkColumns.push(colName);
 
-      if (/\bunique\b/.test(restLower)) uniqueColumnCandidates.push(colName);
+      // Testing restLower directly would also match "unique" sitting inside a DEFAULT string
+      // literal (e.g. DEFAULT 'unique') as if it were the constraint keyword — strip quoted
+      // literals first so only a real, unquoted UNIQUE keyword can match.
+      if (/\bunique\b/.test(withoutQuotedLiterals(restLower))) uniqueColumnCandidates.push(colName);
 
       const refMatch = rest.match(REFERENCES_RE);
       let isForeignKey = false;

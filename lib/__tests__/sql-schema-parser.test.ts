@@ -213,6 +213,30 @@ describe('UNIQUE columns', () => {
     expect(tables[0].uniqueColumns.sort()).toEqual(['Email', 'Phone']);
   });
 
+  it('does not swallow an ordinary column whose name merely starts with "unique"', () => {
+    const { tables, warnings } = parseSchema(`
+      CREATE TABLE t (id SERIAL PRIMARY KEY, unique_code INT, uniqueness_score DECIMAL(4,2));
+    `);
+    expect(tables[0].columns.map((c) => c.name)).toEqual(['id', 'unique_code', 'uniqueness_score']);
+    expect(tables[0].uniqueColumns).toEqual([]);
+    expect(warnings).toEqual([]);
+  });
+
+  it('table-level UNIQUE still matches with no space before the parenthesis', () => {
+    const { tables } = parseSchema('CREATE TABLE t (id SERIAL PRIMARY KEY, code INT, UNIQUE(code));');
+    expect(tables[0].uniqueColumns).toEqual(['code']);
+  });
+
+  it('does not mistake the word "unique" inside a DEFAULT string literal for the constraint keyword', () => {
+    const { tables } = parseSchema(`CREATE TABLE t (id SERIAL PRIMARY KEY, note TEXT DEFAULT 'unique');`);
+    expect(tables[0].uniqueColumns).toEqual([]);
+  });
+
+  it('still detects a real UNIQUE constraint alongside a DEFAULT literal that contains the word "unique"', () => {
+    const { tables } = parseSchema(`CREATE TABLE t (id SERIAL PRIMARY KEY, note TEXT DEFAULT 'unique' UNIQUE);`);
+    expect(tables[0].uniqueColumns).toEqual(['note']);
+  });
+
   it('a UNIQUE foreign key is recorded as both a foreign key and a unique column', () => {
     const { tables } = parseSchema(`
       CREATE TABLE user_profiles (

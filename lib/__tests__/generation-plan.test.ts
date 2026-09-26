@@ -903,6 +903,18 @@ describe('buildGenerationPlan & generateTableRows: UNIQUE value-only columns', (
     }
   });
 
+  it('a DECIMAL with a very large scale (fracRange would overflow to Infinity) still terminates and produces finite values', () => {
+    // NUMERIC(1000,999): scale=999 makes 10**scale overflow to Infinity if left uncapped, which
+    // then made sampleDistinctIndices spin forever trying to fill a Set with Math.random()*Infinity
+    // (always Infinity, so the Set's size never grows past 1). This must complete quickly, not hang.
+    const { plan, values } = single('NUMERIC(1000,999)', { rows: 50 });
+    expect(plan.tables[0].rowCount).toBe(50);
+    for (const v of values) {
+      expect(Number.isFinite(v) || (typeof v === 'string' && /^-?\d+(\.\d+)?$/.test(v))).toBe(true);
+    }
+    expect(new Set(values).size).toBe(values.length);
+  }, 5000);
+
   it('generates distinct FLOAT, DATE, TIMESTAMP, TIME and UUID UNIQUE values at several thousand rows', () => {
     for (const [sqlType, semantic] of [
       ['REAL', undefined],
