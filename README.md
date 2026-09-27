@@ -2,12 +2,13 @@
 
 Schema-aware mock data for SQL. Paste your `CREATE TABLE` statements and MockMorph streams back ready-to-run `INSERT` statements for **PostgreSQL** or **MySQL**, with foreign keys that point at rows that actually exist.
 
-Table structure (order, primary keys, foreign keys) is worked out **locally** by a SQL parser and a topological sort. An AI model (Groq) is used for one narrow job only: labelling each plain column with a semantic type (email, name, price, ...) so the fake values look sensible.
+Table structure (order, primary keys, foreign keys) is worked out **locally** by a SQL parser and a topological sort. Every value's shape — integer, decimal, boolean, date, UUID, and so on — is also worked out locally, from the column's declared SQL type. An AI model (Groq) is used for one narrower job: labelling **text** columns with a semantic type (email, name, price, ...) so the fake values look sensible; it has no say over any other column type.
 
 ## Features
 
 - **Local dependency resolution.** Foreign-key relationships are parsed from your SQL and ordered with Kahn's algorithm, so parent tables are always inserted before their children. Foreign keys pointing at missing tables, and cycles between tables in which every foreign key is `NOT NULL`, are rejected before any row is generated. A cycle that a nullable foreign key can break is accepted: that column is generated as `NULL` (its parent is created later) and the analysis reports a warning.
 - **Correct foreign keys.** Every table keeps a pool of the primary keys it generated. A foreign key picks its value from the pool of the table its `REFERENCES` clause names, however many tables sit in between.
+- **Type-correct values.** A column's declared SQL type decides the shape of its generated value: a plain `INT` gets an integer inside a sensible range (common names like `age`, `quantity`, `rating`, `year` and `count` get realistic ranges, not a flat 1–1000), `DECIMAL(p,s)` gets a value that fits its precision and scale, and booleans, dates, timestamps, times, UUIDs, `JSON` and arrays each get a correctly-shaped value. The AI's semantic label is only consulted for **text** columns, and text is truncated to the column's declared length.
 - **Self-referencing foreign keys.** A table can reference its own primary key (for example `employees.manager_id REFERENCES employees(id)`), with integer or UUID keys, inline or table-level, and any number of such columns per table. A row may only point at a row generated earlier in the same table, so the data is always a valid hierarchy with no cycles. A nullable column gets `NULL` for the first row (a root) and for about a fifth of the rest; a `NOT NULL` column makes the first row reference itself, which PostgreSQL accepts but has not been verified on MySQL.
 - **1:1 tables (a primary key that is also a foreign key).** A table like `user_profiles(user_id INT PRIMARY KEY REFERENCES users(id))` gets its keys sampled from the parent's own generated primary keys, so every row is a real parent row and no two rows share one. Chains of these (`a <- b <- c`) work the same way. If the requested row count would exceed the parent's, the table is capped at the parent's row count instead, with a warning explaining why.
 - **UNIQUE columns.** A single-column `UNIQUE` constraint (`code INT UNIQUE`, or table-level `UNIQUE (code)`) is enforced, not just parsed: every generated value is guaranteed distinct across the table's rows, for integer, decimal, float, text, date, timestamp, time and UUID columns — text distinctness holds up even after truncation to a declared `VARCHAR(n)`/`CHAR(n)` length. A `UNIQUE` foreign key that is not the table's primary key (`user_id INT UNIQUE REFERENCES users(id)`) samples the parent's keys without replacement, the same as a 1:1 table. If a column's type has too small a value space for the requested row count (`BOOLEAN UNIQUE`, a narrow `VARCHAR(2) UNIQUE`, ...), the table is capped at that value space instead, with a warning explaining why — the same choice already made for 1:1 tables, applied consistently. A composite (multi-column) `UNIQUE` is not enforced; it is reported as a warning instead. Neither is a `UNIQUE` self-referencing foreign key.
@@ -22,7 +23,7 @@ Table structure (order, primary keys, foreign keys) is worked out **locally** by
 1. `lib/sql-schema-parser.ts` parses `CREATE TABLE` statements into tables, columns, primary keys and foreign keys.
 2. `lib/dependency-resolver.ts` runs Kahn's algorithm over the foreign-key graph to get the generation order.
 3. `lib/schema-analysis.ts` combines both, validates identifiers and primary-key support, and asks Groq for column semantic types (unless a cached classification is supplied).
-4. `lib/generation-plan.ts` validates the full plan (every foreign key must target a primary key, generated earlier or, for a self-reference, from rows of the same table generated earlier) and then produces the rows.
+4. `lib/generation-plan.ts` validates the full plan (every foreign key must target a primary key, generated earlier or, for a self-reference, from rows of the same table generated earlier) and then produces the rows, using each column's declared SQL type (`lib/sql-types.ts`) to choose the shape of its value and the AI's semantic label only for text columns.
 5. `app/api/generate/route.ts` streams the `INSERT` statements and saves the run to the database.
 
 Steps 1–2 run on every request. The client cannot supply table order, keys or relationships.
@@ -139,7 +140,7 @@ Streams `INSERT` statements as plain text.
 
 - Schemas are limited to 50,000 characters.
 - AI calls are limited to **5 per hour per user**, shared by `/api/analyze` and by `/api/generate` when it has to call Groq itself (no `cachedColumnTypes`). Schemas that can never be generated (cycles of `NOT NULL` foreign keys, missing tables, unsupported keys) are rejected before any AI call or quota use.
-- Row distribution: every table except the last one in dependency order gets 15 rows; the last table gets the remainder of the requested total (at least 1). With many tables the total can exceed the requested count.
+- Row distribution: every table except the last one in dependency order gets 15 rows; the last table gets the remainder of the requested total (at least 1). With many tables the total can exceed the requested count. A 1:1 table or a `UNIQUE` column can lower this further — see Features above.
 
 ## Supported SQL
 
@@ -166,9 +167,8 @@ Not supported yet:
 
 These are open issues rather than design choices:
 
-- **Plain integer columns** (such as `quantity` or `stock`) are filled with string placeholders, because the semantic type list has no integer type. Those `INSERT`s will fail on a typed integer column.
+- **A column type the generator does not recognize** (a custom enum, `inet`, `interval`, `money`, ...) is generated as text and may be rejected by the database. The analysis reports a warning for this, though the UI does not display warnings yet.
 - **Generated values are templated.** Emails, names and companies come from fixed patterns, not a realistic data library. Values do not consider `CHECK` constraints or enum types.
-- The generate UI shows the HTTP status code, not the server's error message, when a request is rejected.
 
 ## Project structure
 
@@ -184,8 +184,10 @@ lib/
   sql-schema-parser.ts     CREATE TABLE -> tables / PKs / FKs
   dependency-resolver.ts   Kahn's algorithm
   schema-analysis.ts       parse + validate + Groq classification
+  sql-types.ts             declared SQL type -> kind of value
   generation-plan.ts       plan validation and row generation
   identifier-safety.ts     identifier allowlist and quoting
+  error-messages.ts        parses server error responses for the UI
   rate-limit.ts            shared AI-call quota
   groq.ts                  Groq client and response validation
   __tests__/               Vitest unit tests
@@ -198,7 +200,7 @@ prisma/schema.prisma       database schema
 npm test
 ```
 
-The suite covers the SQL parser, dependency resolver (including cycles and diamond graphs), identifier safety, schema analysis, generation planning (including foreign-key integrity across multi-parent and deep chains and self-referencing keys) and the rate limiter. The Prisma, session and Groq boundaries are mocked, and the Groq API is never called. The end-to-end tests call the real `POST /api/generate` handler and run the SQL it streams in a real PostgreSQL engine (PGlite, in-process), so no external database is needed; generated MySQL output is not executed against a MySQL server.
+246 tests across 10 files. The suite covers the SQL parser, dependency resolver (including cycles and diamond graphs), identifier safety, schema analysis, generation planning (foreign-key integrity across multi-parent and deep chains, self-referencing keys, one-to-one tables, and `UNIQUE` columns), the declared-SQL-type classifier, server error-message parsing, and the rate limiter. The Prisma, session and Groq boundaries are mocked, and the Groq API is never called. The end-to-end tests call the real `POST /api/generate` handler and run the SQL it streams in a real PostgreSQL engine (PGlite, in-process), so no external database is needed; generated MySQL output is not executed against a MySQL server.
 
 ## Deployment
 
